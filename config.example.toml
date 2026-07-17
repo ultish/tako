@@ -1,0 +1,63 @@
+# Example tako config. Copy to ~/.config/tako/config.toml (or pass
+# --config-dir) and edit scan roots / tool defaults for your machine.
+#
+# Path is deliberately ~/.config/tako/ on both macOS and Linux (same as rakko).
+
+[scan]
+# One or more filesystem roots to walk for skaffold + Gradle projects.
+roots = ["/Users/you/Developer/services", "/Users/you/Developer/libs"]
+max_depth = 6
+ignore = ["**/.git/**", "**/build/**", "**/node_modules/**"]
+# Drop specific projects from the inventory (still walk parents).
+# Match by leaf name, path fragment, absolute path, or simple globs:
+#   exclude = ["legacy-api", "services/sandbox", "**/tmp-*", "~/Developer/old"]
+exclude = []
+
+[gradle]
+# Always use `gradle` on PATH (air-gap friendly). Do not download via wrapper.
+# command = "gradle"          # override if needed (absolute path ok)
+default_tasks_build = ["build"]
+default_tasks_publish = ["publish"]
+# Consumer steps of B/P inject an init script (cacheChangingModulesFor 0) so
+# just-published Nexus SNAPSHOTs re-resolve without --refresh-dependencies.
+force_latest_snapshots = true
+
+[skaffold]
+default_profile = ""          # optional Skaffold profile name
+dev_args = []                 # extra args for `skaffold dev`
+debug_args = ["--port-forward"]  # example; tune to your setup
+
+[git]
+pull_ff_only = true           # never invent merge commits; fail → user fixes
+# pull_args = []              # extra args if needed
+
+# Phase 2 — deployed version compare (kubectl read-only).
+# Prefer Settings tab (4) in the TUI to toggle enabled / namespaces / context.
+# Press K on Projects after enabling.
+[kube]
+enabled = false                 # default off until you enable in Settings (4)
+# context = "docker-desktop"    # empty = current kubectl context
+namespaces = ["default"]
+# How to read the version from each Deployment:
+#   auto  (default) — version labels, then semver-ish image tags, else "live"
+#   label:app.kubernetes.io/version
+#   image_tag
+#   annotation:tako/version
+#   env:APP_VERSION
+version_source = "auto"
+# command = "kubectl"
+
+# After publishing a lib/avro:
+#   B = publish → rebuild dependents (no skaffold)
+#   P = publish → rebuild + skaffold delete/run per consumer
+[cascade]
+default_consumer_gradle = ["build"]
+default_consumer_skaffold = ["delete", "run"]   # or ["dev"] for interactive
+# After source publish, run up to N consumer steps at once (per-project order
+# kept: build then skaffold for the same service). 1 = fully sequential.
+max_parallel = 5
+
+# TUI appearance (also set by A / T keys in the app, which write back here).
+[ui]
+theme = "dark"          # dark | light
+banner_mode = "off"     # wave | ms (ms/frame) | fps (paint capacity) | off

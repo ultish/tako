@@ -1,0 +1,6 @@
+[versions]
+common = "1.4.2"
+commonRange = "[1.0.0, 2.0.0)"
+
+[libraries]
+common-lib = { module = "com.example:common-lib", version.ref = "commonRange" }
