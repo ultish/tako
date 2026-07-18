@@ -1,6 +1,6 @@
-//! Global help overlay (`?`): workflow flowcharts + per-screen keybind tables.
+//! Global help overlay (`?`): per-screen keybind tables + workflow flowcharts.
 //!
-//! **Tab** (or ←/→) switches between Workflows and Keys.
+//! Opens on **Keys**. **Tab** (or ←/→) switches to **Workflows** and back.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
@@ -26,11 +26,11 @@ const GLOBAL: KeybindSection = KeybindSection {
     entries: &[
         KeybindEntry {
             keys: "?",
-            description: "Toggle this help (opens on Workflows)",
+            description: "Toggle this help (opens on Keys)",
         },
         KeybindEntry {
             keys: "Tab",
-            description: "Switch Workflows ↔ Keys (while help open)",
+            description: "Switch Keys ↔ Workflows (while help open)",
         },
         KeybindEntry {
             keys: "q",

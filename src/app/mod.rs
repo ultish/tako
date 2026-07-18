@@ -133,11 +133,11 @@ pub enum Screen {
 /// Pages inside the `?` help overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HelpPage {
-    /// ASCII flowcharts for lib vs service day-to-day flows.
+    /// Per-screen keybind tables (first page when `?` opens).
     #[default]
-    Workflows,
-    /// Per-screen keybind tables.
     Keys,
+    /// ASCII flowcharts for lib vs service day-to-day flows (Tab from Keys).
+    Workflows,
 }
 
 impl HelpPage {
@@ -504,7 +504,7 @@ impl App {
             banner_mode,
             theme,
             help_visible: false,
-            help_page: HelpPage::Workflows,
+            help_page: HelpPage::Keys,
             frame_ms_samples: RingBuffer::new(FRAME_MS_SAMPLE_CAPACITY),
             show_splash: true,
             scanning: false,
@@ -1690,8 +1690,8 @@ impl App {
             Action::ToggleHelp => {
                 self.help_visible = !self.help_visible;
                 if self.help_visible {
-                    // Land on flowcharts first — keys are the other Tab page.
-                    self.help_page = HelpPage::Workflows;
+                    // Keys first; flowcharts are the second Tab page.
+                    self.help_page = HelpPage::Keys;
                 }
                 vec![]
             }

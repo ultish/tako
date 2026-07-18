@@ -11,6 +11,12 @@ over dumping raw commit subjects.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-18
+
+### Changed
+
+- Help (`?`) opens on **Keys**; flowchart **Workflows** is the second Tab page.
+
 ## [0.2.0] - 2026-07-18
 
 Workflow overhaul: tight keys, catch-up vs you-publish, Nexus/Git columns,
