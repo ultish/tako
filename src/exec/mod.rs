@@ -3,7 +3,7 @@
 //! **Always invoke `gradle` from PATH** (or an absolute override in config) —
 //! never `./gradlew`. Air-gapped machines use a preinstalled Gradle.
 //!
-//! Cascade recipes (`publish_and_redeploy_consumers`) live in [`cascade`].
+//! Multi-step recipes (update dependents / skaffold redeploy) live in [`cascade`].
 
 mod args;
 mod cascade;
@@ -14,11 +14,11 @@ pub use args::{
     git_pull_argv, gradle_argv, skaffold_argv, GitPullPlan, GradlePlan, PlannedCommand,
     SkaffoldPlan,
 };
-#[allow(unused_imports)] // public surface for cascade UI / recipes (M4)
+#[allow(unused_imports)] // public surface for cascade UI / recipes
 pub use cascade::{
-    build_publish_and_rebuild, build_publish_and_redeploy, source_publish_tasks, CascadePlan,
-    CascadeStep, CascadeStepKind, CascadeStepStatus, RECIPE_PUBLISH_AND_REBUILD,
-    RECIPE_PUBLISH_AND_REDEPLOY,
+    build_skaffold_redeploy, build_update_dependents, recipe_summary, recipe_title,
+    skaffold_redeploy_steps, source_publish_tasks, CascadePlan, CascadeStep, CascadeStepKind,
+    CascadeStepStatus, LibNexusRow, RECIPE_SKAFFOLD_REDEPLOY, RECIPE_UPDATE_DEPENDENTS,
 };
 pub use init_script::ensure_snapshot_init_script;
 pub use runner::{spawn_and_stream, SpawnOpts};

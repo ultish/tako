@@ -80,7 +80,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         "n: add root   1: projects   ?: help   q: quit".to_string()
     } else {
         format!(
-            "Tab: {focus}   n: add   e: edit   z: delete   r: rescan   Enter: projects   ?: help   ·  {n_roots} root(s) · {n_excludes} exclude(s) · {n_projects} project(s){last_scan}"
+            "Tab: {focus}   n: add   e: edit   z: delete   w: rescan   Enter: projects   ?: help   ·  {n_roots} root(s) · {n_excludes} exclude(s) · {n_projects} project(s){last_scan}"
         )
     };
     render_status_bar(frame, app, status_bar);
@@ -280,6 +280,24 @@ fn render_workspace_body(
     } else {
         " Scan roots "
     };
+    // Panel-level hit targets first; row clicks register after and win (later = top).
+    app.register_click(
+        lists[0].x,
+        lists[0].y,
+        lists[0].width,
+        lists[0].height,
+        Action::FocusWorkspaceRoots,
+    );
+    app.register_click(
+        lists[1].x,
+        lists[1].y,
+        lists[1].width,
+        lists[1].height,
+        Action::FocusWorkspaceExcludes,
+    );
+
+    // Disable table_nav's built-in SelectRow clicks (wrong action on excludes);
+    // we register the correct actions ourselves below.
     render_selectable_list(
         frame,
         app,
@@ -288,7 +306,7 @@ fn render_workspace_body(
         &root_items,
         Some(&["#", "Path", "On disk", "Projects"]),
         root_sel,
-        roots_focus,
+        false,
     );
     register_root_clicks(app, lists[0], roots.len());
 
@@ -321,7 +339,7 @@ fn render_workspace_body(
         &ex_items,
         Some(&["#", "Pattern"]),
         if excludes.is_empty() { 0 } else { ex_sel },
-        excludes_focus && !excludes.is_empty(),
+        false,
     );
     if !excludes.is_empty() {
         register_exclude_clicks(app, lists[1], excludes.len());
@@ -466,8 +484,8 @@ fn render_exclude_detail_panel(
             ]),
             Line::from(""),
             Line::from(Span::styled("Examples", app.theme.secondary.add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled("  legacy-api", app.theme.text)),
-            Line::from(Span::styled("  services/sandbox", app.theme.text)),
+            Line::from(Span::styled("  avro-schemas", app.theme.text)),
+            Line::from(Span::styled("  services/legacy-api", app.theme.text)),
             Line::from(Span::styled("  **/tmp-*", app.theme.text)),
             Line::from(""),
             Line::from(Span::styled(
@@ -502,11 +520,11 @@ fn render_exclude_detail_panel(
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "Matches project name, leaf, path fragment,",
+            "Exact match on project name or id only",
             app.theme.dim,
         )),
         Line::from(Span::styled(
-            "absolute path, or * / ** globs.",
+            "(avro-schemas ≠ avro-schemas/cats). Or * / ** globs.",
             app.theme.dim,
         )),
         Line::from(""),
@@ -567,19 +585,17 @@ fn register_list_clicks(
     if count == 0 || list_area.height < 3 {
         return;
     }
-    // Match table_nav geometry: border + header row.
-    let header_offset = 2u16;
-    let data_top = list_area.y.saturating_add(header_offset);
-    let data_bottom = list_area
-        .y
-        .saturating_add(list_area.height)
-        .saturating_sub(1);
+    // Match table_nav geometry: inner area = border inset; header is 1 row.
+    let inner = Block::default().borders(Borders::ALL).inner(list_area);
+    let header_h = 1u16;
+    let data_top = inner.y.saturating_add(header_h);
+    let rows_h = inner.height.saturating_sub(header_h);
     for i in 0..count {
-        let y = data_top.saturating_add(i as u16);
-        if y >= data_bottom {
+        if (i as u16) >= rows_h {
             break;
         }
-        app.register_click(list_area.x, y, list_area.width, 1, action(i));
+        let y = data_top.saturating_add(i as u16);
+        app.register_click(inner.x, y, inner.width, 1, action(i));
     }
 }
 

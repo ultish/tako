@@ -15,7 +15,7 @@ use crate::events::Action;
 pub struct RowHighlights {
     /// Dependency rows — typically theme `secondary` (cyan).
     pub secondary: HashSet<usize>,
-    /// Dependent / consumer rows — typically theme `warning`.
+    /// “Needed by” rows — typically theme `warning`.
     pub warning: HashSet<usize>,
 }
 

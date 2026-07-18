@@ -58,9 +58,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    // Cascade plan confirm sits above screens, below help/quit.
+    // Cascade / bump plan confirms sit above screens, below help/quit.
     if app.plan_confirming() {
         screens::cascade_plan::render(frame, app, area);
+    }
+    if app.bump_confirming() {
+        screens::bump_plan::render(frame, app, area);
     }
 
     if app.help_visible {

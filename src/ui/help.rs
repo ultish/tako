@@ -1,4 +1,6 @@
-//! Global help overlay (`?`) built from a shared per-screen keybind table.
+//! Global help overlay (`?`): workflow flowcharts + per-screen keybind tables.
+//!
+//! **Tab** (or ←/→) switches between Workflows and Keys.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
@@ -6,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Screen};
+use crate::app::{App, HelpPage, Screen};
 use crate::ui::widgets::confirm_dialog::centered_rect;
 
 pub struct KeybindEntry {
@@ -24,7 +26,11 @@ const GLOBAL: KeybindSection = KeybindSection {
     entries: &[
         KeybindEntry {
             keys: "?",
-            description: "Toggle this help",
+            description: "Toggle this help (opens on Workflows)",
+        },
+        KeybindEntry {
+            keys: "Tab",
+            description: "Switch Workflows ↔ Keys (while help open)",
         },
         KeybindEntry {
             keys: "q",
@@ -35,28 +41,20 @@ const GLOBAL: KeybindSection = KeybindSection {
             description: "Force quit",
         },
         KeybindEntry {
-            keys: "A",
-            description: "Cycle banner (wave → ms/frame → fps → off); saved to config",
+            keys: "A / T",
+            description: "Cycle banner / theme",
         },
         KeybindEntry {
-            keys: "T",
-            description: "Cycle theme (dark ↔ light); saved to config",
-        },
-        KeybindEntry {
-            keys: "j/k · ↑/↓",
-            description: "Move selection",
-        },
-        KeybindEntry {
-            keys: "Enter",
-            description: "Confirm / open",
-        },
-        KeybindEntry {
-            keys: "Esc",
-            description: "Back / cancel",
+            keys: "j/k · Enter · Esc",
+            description: "Move / open / back",
         },
         KeybindEntry {
             keys: "1/2/3/4",
-            description: "Jump Projects / Jobs / Workspace / Settings",
+            description: "Projects / Jobs / Workspace / Settings",
+        },
+        KeybindEntry {
+            keys: "w",
+            description: "Rescan workspace roots",
         },
     ],
 };
@@ -65,20 +63,8 @@ const SETTINGS: KeybindSection = KeybindSection {
     title: "Settings",
     entries: &[
         KeybindEntry {
-            keys: "j/k · ↑/↓",
-            description: "Move between settings",
-        },
-        KeybindEntry {
-            keys: "Enter · Space",
-            description: "Toggle bool / cycle / open editor",
-        },
-        KeybindEntry {
-            keys: "← / →",
-            description: "Nudge integer settings",
-        },
-        KeybindEntry {
-            keys: "kube.enabled",
-            description: "Toggle cluster version probing (then K on Projects)",
+            keys: "j/k · Enter · ←/→",
+            description: "Move / edit / nudge ints",
         },
     ],
 };
@@ -87,68 +73,72 @@ const PROJECT_BROWSER: KeybindSection = KeybindSection {
     title: "Project browser",
     entries: &[
         KeybindEntry {
-            keys: "Space",
-            description: "Toggle multi-select on cursor (* mark); Esc clears set",
+            keys: "— Shared —",
+            description: "",
         },
         KeybindEntry {
-            keys: "r",
-            description: "Refresh / rescan workspace roots",
-        },
-        KeybindEntry {
-            keys: "b",
-            description: "Gradle build — cursor, or all multi-selected",
-        },
-        KeybindEntry {
-            keys: "B",
-            description: "Publish → rebuild dependents (confirm plan; SNAPSHOT refresh)",
+            keys: "b / B",
+            description: "Build / build with latest SNAPSHOT (no stale cache)",
         },
         KeybindEntry {
             keys: "c",
-            description: "Gradle clean — cursor, or all multi-selected",
+            description: "Clean",
         },
         KeybindEntry {
             keys: "p",
-            description: "Gradle publish (cursor project only)",
+            description: "Publish to Nexus",
+        },
+        KeybindEntry {
+            keys: "v / V",
+            description: "Bump this version / bump all dependent versions",
         },
         KeybindEntry {
             keys: "G",
-            description: "Git pull (ff-only) — cursor, or unique git roots among multi",
+            description: "Git pull --ff-only",
         },
         KeybindEntry {
-            keys: "d / D",
-            description: "Skaffold dev / debug (-f skaffold file; cursor only)",
+            keys: "r",
+            description: "Refresh stats: git fetch+lag, Nexus versions, kube if enabled",
         },
         KeybindEntry {
-            keys: "x / u",
-            description: "Skaffold delete / run (cursor only)",
+            keys: "w",
+            description: "Rescan workspace",
         },
         KeybindEntry {
-            keys: "P",
-            description: "Cascade publish → rebuild + skaffold redeploy consumers",
+            keys: "— Lib —",
+            description: "",
+        },
+        KeybindEntry {
+            keys: "U",
+            description: "Update dependents — Nexus check libs, then services: pull/clean/B/delete→run",
+        },
+        KeybindEntry {
+            keys: "i",
+            description: "Who needs this? (dependent tree)",
+        },
+        KeybindEntry {
+            keys: "— Service —",
+            description: "",
+        },
+        KeybindEntry {
+            keys: "u / x",
+            description: "Skaffold delete→run / delete only",
         },
         KeybindEntry {
             keys: "K",
-            description: "Probe cluster Deployments for deployed versions ([kube] config)",
+            description: "Probe cluster deployed versions",
         },
         KeybindEntry {
-            keys: "f",
-            description: "Toggle drift-only filter (local▲ / cluster▲ / unknown)",
+            keys: "— List —",
+            description: "",
         },
         KeybindEntry {
-            keys: "-",
-            description: "Exclude cursor (or multi-selected) from inventory → [scan].exclude",
+            keys: "Space / m",
+            description: "Toggle multi-select on cursor (● mark) · then b/B/c/G bulk",
         },
         KeybindEntry {
-            keys: "Enter",
-            description: "Open full-screen project detail (deps + actions)",
-        },
-        KeybindEntry {
-            keys: "2",
-            description: "Open Jobs console (live logs)",
-        },
-        KeybindEntry {
-            keys: "/",
-            description: "Filter projects — later milestone",
+            keys: "- / F / /",
+            description: "Hide · favorite · filter",
         },
     ],
 };
@@ -158,10 +148,10 @@ const JOBS: KeybindSection = KeybindSection {
     entries: &[
         KeybindEntry {
             keys: "Esc",
-            description: "Cancel focused job (when running)",
+            description: "Cancel focused job",
         },
         KeybindEntry {
-            keys: "Tab",
+            keys: "Tab · click",
             description: "Focus list vs log",
         },
     ],
@@ -171,45 +161,21 @@ const WORKSPACE: KeybindSection = KeybindSection {
     title: "Workspace",
     entries: &[
         KeybindEntry {
-            keys: "Tab",
-            description: "Focus scan roots vs project excludes",
+            keys: "Tab · click",
+            description: "Focus roots vs excludes",
         },
         KeybindEntry {
-            keys: "n",
-            description: "Add root or exclude (depends on focus)",
+            keys: "n / e / z",
+            description: "Add / edit / delete",
         },
         KeybindEntry {
-            keys: "e",
-            description: "Edit selected root / exclude pattern",
-        },
-        KeybindEntry {
-            keys: "z",
-            description: "Delete selected root / exclude (confirm)",
-        },
-        KeybindEntry {
-            keys: "j/k · ↑/↓",
-            description: "Move selection in focused list",
-        },
-        KeybindEntry {
-            keys: "r",
-            description: "Rescan configured roots (applies excludes)",
-        },
-        KeybindEntry {
-            keys: "Enter",
-            description: "Open project browser (or save while editing)",
-        },
-        KeybindEntry {
-            keys: "Esc",
-            description: "Cancel editor / back to projects",
-        },
-        KeybindEntry {
-            keys: "1",
-            description: "Jump to project browser",
+            keys: "w",
+            description: "Rescan roots",
         },
     ],
 };
 
-/// Sections shown for the current screen (global always first).
+/// Sections for the Keys page (global + current screen).
 pub fn sections_for(app: &App) -> Vec<&'static KeybindSection> {
     let mut sections = vec![&GLOBAL];
     match app.screen {
@@ -221,17 +187,18 @@ pub fn sections_for(app: &App) -> Vec<&'static KeybindSection> {
     sections
 }
 
-/// Full-screen dimmed overlay listing keybinds for the active screen.
+/// Full-screen dimmed overlay: workflows flowchart or keybind tables.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let dialog = centered_rect(78, 80, area);
+    let dialog = centered_rect(90, 88, area);
     frame.render_widget(Clear, dialog);
 
     let theme = &app.theme;
+    let page = app.help_page.label();
+    let other = app.help_page.other().label();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
-            " Help — {}  (theme: {}) ",
-            screen_label(app.screen),
+            " Help · {page}  (Tab → {other}) · theme: {} ",
             theme.name.label()
         ))
         .title_style(theme.title)
@@ -245,23 +212,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for section in sections_for(app) {
-        lines.push(Line::from(Span::styled(
-            section.title,
-            theme.title.add_modifier(Modifier::UNDERLINED),
-        )));
-        for entry in section.entries {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:<18}", entry.keys),
-                    theme.secondary.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(entry.description, theme.dim),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
+    let lines = match app.help_page {
+        HelpPage::Workflows => workflow_lines(app),
+        HelpPage::Keys => keybind_lines(app),
+    };
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -270,16 +224,175 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new("?: close   Esc: close").style(theme.secondary),
+        Paragraph::new("Tab: switch page   ?/Esc: close").style(theme.secondary),
         chunks[1],
     );
 }
 
-fn screen_label(screen: Screen) -> &'static str {
-    match screen {
-        Screen::ProjectBrowser => "Projects",
-        Screen::Jobs => "Jobs",
-        Screen::Workspace => "Workspace",
-        Screen::Settings => "Settings",
+fn keybind_lines(app: &App) -> Vec<Line<'static>> {
+    let theme_secondary = app.theme.secondary;
+    let theme_title = app.theme.title;
+    let theme_dim = app.theme.dim;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for section in sections_for(app) {
+        lines.push(Line::from(Span::styled(
+            section.title,
+            theme_title.add_modifier(Modifier::UNDERLINED),
+        )));
+        for entry in section.entries {
+            if entry.description.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", entry.keys),
+                    theme_dim.add_modifier(Modifier::BOLD),
+                )));
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<20}", entry.keys),
+                    theme_secondary.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.description, theme_dim),
+            ]));
+        }
+        lines.push(Line::from(""));
     }
+    lines
 }
+
+fn workflow_lines(app: &App) -> Vec<Line<'static>> {
+    let t = app.theme.title.add_modifier(Modifier::BOLD);
+    let s = app.theme.secondary.add_modifier(Modifier::BOLD);
+    let d = app.theme.dim;
+    let w = app.theme.warning;
+    let ok = app.theme.success;
+
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Libs publish to Nexus. Services resolve from Nexus, then skaffold.",
+        d,
+    )));
+    lines.push(Line::from(""));
+
+    // ── Someone else updated ───────────────────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "1) Someone else already published (catch-up)",
+        t,
+    )));
+    lines.push(Line::from(Span::styled(
+        "   Parent lib + child libs are on Nexus. You only refresh services.",
+        d,
+    )));
+    lines.push(Line::from(""));
+    for row in [
+        "   select lib",
+        "       │",
+        "       ▼",
+        "   ┌─────────────────────────────────────────┐",
+        "   │  U  Update dependents                   │",
+        "   │  ① libs in tree → check Nexus vs cache  │",
+        "   │     (warn if missing / not newer)       │",
+        "   │  ② each SERVICE:                        │",
+        "   │     git pull → clean → B (no cache)     │",
+        "   │     → skaffold delete → run             │",
+        "   │     (skip skaffold if Argo)             │",
+        "   └─────────────────────────────────────────┘",
+    ] {
+        let style = if row.contains('U') {
+            s
+        } else if row.contains('①') || row.contains('②') {
+            w
+        } else {
+            d
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    lines.push(Line::from(""));
+
+    // ── You own the change ─────────────────────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "2) You are changing the libs (you publish)",
+        t,
+    )));
+    lines.push(Line::from(""));
+    for row in [
+        "   select root lib",
+        "       │",
+        "       ▼",
+        "   V  bump versions on child libs + services  (manual plan, y)",
+        "       │",
+        "       ▼",
+        "   on each lib you own (parent, then children):",
+        "       b/B build  →  p publish to Nexus",
+        "       │",
+        "       ▼",
+        "   U  same as (1) — Nexus check, then services pull/clean/B/delete→run",
+    ] {
+        let style = if row.starts_with("   V") || row.contains(" U ") || row.starts_with("   U")
+        {
+            s
+        } else if row.contains("p publish") || row.contains("b/B") {
+            ok
+        } else {
+            d
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    lines.push(Line::from(""));
+
+    // ── Single service ─────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "3) Just this service",
+        t,
+    )));
+    lines.push(Line::from(""));
+    for row in [
+        "   select service",
+        "       │",
+        "       ▼",
+        "   B  build no-cache (optional)   →   u  skaffold delete→run",
+        "   v  bump this version (optional, before deploy)",
+        "   p  publish only if you ship the service jar (rare)",
+    ] {
+        let style = if row.contains(" B ") || row.contains(" u ") {
+            s
+        } else {
+            d
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    lines.push(Line::from(""));
+
+    // ── Cheat sheet ────────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled("Quick map", t)));
+    lines.push(Line::from(vec![
+        Span::styled("   U  ", s),
+        Span::styled("catch-up services (Nexus already right)", d),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   V  ", s),
+        Span::styled("bump dependent versions in-repo", d),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   p  ", s),
+        Span::styled("publish this project to Nexus", d),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   B  ", s),
+        Span::styled("force latest SNAPSHOT resolve + build", d),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("   u  ", s),
+        Span::styled("this service only: delete → run", d),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "U on a service with nothing depending on it → status only (use B then u).",
+        w,
+    )));
+
+    lines
+}
+

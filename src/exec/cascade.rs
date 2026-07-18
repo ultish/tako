@@ -1,25 +1,72 @@
-//! Cascade recipes: build a confirmable plan, then run steps sequentially.
+//! Multi-step plans: confirmable recipe → sequential/parallel steps.
 //!
-//! - [`RECIPE_PUBLISH_AND_REBUILD`] (**B**) — publish producer, then gradle build
-//!   each range-aware consumer (no skaffold). Consumer builds may inject a
-//!   SNAPSHOT-refresh init script.
-//! - [`RECIPE_PUBLISH_AND_REDEPLOY`] (**P**) — same plus skaffold delete/run per consumer.
+//! - [`RECIPE_UPDATE_DEPENDENTS`] (**U**) — dependent **libs** = Nexus status only;
+//!   **services** = git pull → clean → build (latest SNAPSHOT) → skaffold delete→run.
+//! - [`RECIPE_SKAFFOLD_REDEPLOY`] (**u**) — this project: delete then run.
 
 use std::path::PathBuf;
 
-use crate::app::ProjectRow;
+use crate::app::{ProjectKind, ProjectRow};
 use crate::config::Config;
 use crate::graph::DependencyGraph;
 
-/// Recipe id for **B**: publish → rebuild dependents (no skaffold).
-pub const RECIPE_PUBLISH_AND_REBUILD: &str = "publish_and_rebuild_consumers";
+/// **U**: Nexus-check dependent libs; run services only.
+pub const RECIPE_UPDATE_DEPENDENTS: &str = "update_dependents";
 
-/// Recipe id for **P**: publish → rebuild + skaffold redeploy dependents.
-pub const RECIPE_PUBLISH_AND_REDEPLOY: &str = "publish_and_redeploy_consumers";
+/// **u**: skaffold delete then run for the cursor project.
+pub const RECIPE_SKAFFOLD_REDEPLOY: &str = "skaffold_redeploy";
 
-/// Kind of work a cascade step performs.
+/// Short human title for plan overlays / status (not the stable recipe id).
+pub fn recipe_title(recipe: &str) -> &'static str {
+    match recipe {
+        RECIPE_UPDATE_DEPENDENTS => "Update dependents",
+        RECIPE_SKAFFOLD_REDEPLOY => "Skaffold redeploy",
+        _ => "Plan",
+    }
+}
+
+/// One-line plain-English summary of what the recipe does.
+pub fn recipe_summary(recipe: &str) -> &'static str {
+    match recipe {
+        RECIPE_UPDATE_DEPENDENTS => {
+            "Libs: Nexus status (no local build). Services: git pull → clean → B → delete→run"
+        }
+        RECIPE_SKAFFOLD_REDEPLOY => "skaffold delete, then skaffold run (updates the image cleanly)",
+        _ => "Run the planned steps in order",
+    }
+}
+
+/// Always delete then run (user requirement for correct image updates).
+pub fn skaffold_redeploy_steps() -> [&'static str; 2] {
+    ["delete", "run"]
+}
+
+/// Dependent lib/avro row — shown on the U plan, **not executed**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibNexusRow {
+    pub project_id: String,
+    pub project_name: String,
+    pub local_version: String,
+    pub produces: String,
+    /// `ok` | `warn` | `unknown`
+    pub status: String,
+    pub detail: String,
+}
+
+impl LibNexusRow {
+    pub fn status_glyph(&self) -> &'static str {
+        match self.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            _ => "?",
+        }
+    }
+}
+
+/// Kind of work a cascade step performs (executable rows only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeStepKind {
+    GitPull,
     /// Gradle tasks; `force_latest_snapshots` adds tako's SNAPSHOT init script.
     Gradle {
         tasks: Vec<String>,
@@ -29,9 +76,10 @@ pub enum CascadeStepKind {
 }
 
 impl CascadeStepKind {
-    /// Column label for the plan table (`gradle clean build publish`, `skaffold run`).
+    /// Column label for the plan table.
     pub fn step_label(&self) -> String {
         match self {
+            CascadeStepKind::GitPull => "git pull --ff-only".into(),
             CascadeStepKind::Gradle {
                 tasks,
                 force_latest_snapshots,
@@ -42,7 +90,7 @@ impl CascadeStepKind {
                     format!("gradle {}", tasks.join(" "))
                 };
                 if *force_latest_snapshots {
-                    format!("{base} (snap)")
+                    format!("{base} (latest SNAPSHOT)")
                 } else {
                     base
                 }
@@ -56,6 +104,7 @@ impl CascadeStepKind {
     /// Task / argv column (tasks joined, or `-f` file leaf).
     pub fn task_column(&self, skaffold_file: Option<&std::path::Path>) -> String {
         match self {
+            CascadeStepKind::GitPull => "ff-only".into(),
             CascadeStepKind::Gradle { tasks, .. } => tasks
                 .iter()
                 .map(|t| {
@@ -131,6 +180,9 @@ pub struct CascadePlan {
     pub source_id: String,
     pub source_name: String,
     pub source_version: String,
+    /// Dependent libs (U plan): Nexus status only — not run as jobs.
+    pub lib_checks: Vec<LibNexusRow>,
+    /// Executable steps (services for U; delete→run for u).
     pub steps: Vec<CascadeStep>,
     /// Scroll / highlight cursor in the plan table (confirm UI).
     pub cursor: usize,
@@ -262,21 +314,18 @@ impl CascadePlan {
         }
     }
 
-    /// True once every source_id step is Ok or Skipped.
+    /// True once every source_id step is Ok or Skipped (or there are none).
     fn source_barrier_open(&self) -> bool {
-        let mut saw_source = false;
         for step in &self.steps {
             if step.project_id != self.source_id {
                 continue;
             }
-            saw_source = true;
             match step.status {
                 CascadeStepStatus::Ok | CascadeStepStatus::Skipped => {}
                 _ => return false,
             }
         }
-        // No explicit source steps → open (degenerate plan).
-        saw_source || self.steps.is_empty()
+        true
     }
 
     /// Remaining pending steps after a failure become skipped (running left alone).
@@ -323,36 +372,12 @@ pub fn source_publish_tasks(config: &Config) -> Vec<String> {
     tasks
 }
 
-/// Build the **B** plan: publish source, then rebuild dependents (no skaffold).
-pub fn build_publish_and_rebuild(
+/// **U**: dependent libs → Nexus status only; services → pull/clean/B/delete→run.
+pub fn build_update_dependents(
     projects: &[ProjectRow],
     graph: &DependencyGraph,
     source_index: usize,
     config: &Config,
-) -> Result<CascadePlan, String> {
-    build_publish_cascade(projects, graph, source_index, config, false)
-}
-
-/// Build the **P** plan: publish source, rebuild + skaffold redeploy dependents.
-pub fn build_publish_and_redeploy(
-    projects: &[ProjectRow],
-    graph: &DependencyGraph,
-    source_index: usize,
-    config: &Config,
-) -> Result<CascadePlan, String> {
-    build_publish_cascade(projects, graph, source_index, config, true)
-}
-
-/// Shared plan builder for publish → consumers.
-///
-/// Consumers = [`DependencyGraph::dependents_of`] (project edges + range-aware coords).
-/// Warnings include catalog range exclusions for the published version.
-fn build_publish_cascade(
-    projects: &[ProjectRow],
-    graph: &DependencyGraph,
-    source_index: usize,
-    config: &Config,
-    include_skaffold: bool,
 ) -> Result<CascadePlan, String> {
     let source = projects
         .get(source_index)
@@ -362,41 +387,30 @@ fn build_publish_cascade(
         .unwrap_or(source.name.as_str())
         .to_string();
 
-    let publish_tasks = source_publish_tasks(config);
-    if publish_tasks.is_empty() {
-        return Err("no gradle publish tasks configured".into());
+    let consumers = graph.dependents_transitive_topo(&source_id);
+    if consumers.is_empty() {
+        return Err(format!(
+            "nothing depends on {} in the workspace — nothing to update",
+            source.name
+        ));
     }
 
-    let mut steps = Vec::new();
-
-    // 1) Source: clean / build / publish (no snapshot init — we are the publisher)
-    steps.push(CascadeStep {
-        kind: CascadeStepKind::Gradle {
-            tasks: publish_tasks,
-            force_latest_snapshots: false,
-        },
-        project_id: source_id.clone(),
-        project_name: source.name.clone(),
-        project_path: source.path.clone(),
-        gradle_dir: source.gradle_project_dir().to_path_buf(),
-        skaffold_file: source.skaffold_path.clone(),
-        status: CascadeStepStatus::Pending,
-        job_id: None,
-    });
-
-    // 2) Consumers (alphabetical from graph)
-    let consumers = graph.dependents_of(&source_id);
-    let consumer_gradle = if config.cascade.default_consumer_gradle.is_empty() {
-        vec!["build".to_string()]
+    let build_tasks = if config.cascade.default_consumer_gradle.is_empty() {
+        config.gradle.default_tasks_build.clone()
     } else {
         config.cascade.default_consumer_gradle.clone()
     };
-    let consumer_skaffold = if config.cascade.default_consumer_skaffold.is_empty() {
-        vec!["delete".into(), "run".into()]
+    let clean_tasks = if config.gradle.default_tasks_clean.is_empty() {
+        vec!["clean".to_string()]
     } else {
-        config.cascade.default_consumer_skaffold.clone()
+        config.gradle.default_tasks_clean.clone()
     };
     let force_snaps = config.gradle.force_latest_snapshots;
+
+    let mut lib_checks = Vec::new();
+    let mut steps = Vec::new();
+    let mut warnings = Vec::new();
+    let mut n_services = 0usize;
 
     for consumer_id in &consumers {
         let Some(idx) = graph.index_of(consumer_id) else {
@@ -406,41 +420,162 @@ fn build_publish_cascade(
             continue;
         };
 
+        // Intermediate libs/avro: Nexus status only — local gradle build won't
+        // put them on Nexus for services to consume.
+        let is_lib_like = matches!(
+            row.kind,
+            ProjectKind::Library | ProjectKind::Avro
+        ) || (!row.has_skaffold && row.skaffold_path.is_none());
+
+        if is_lib_like && !matches!(row.kind, ProjectKind::Service) {
+            let produces = graph.produces_of_id(consumer_id);
+            let produces_s = if produces.is_empty() {
+                "—".into()
+            } else {
+                produces
+                    .iter()
+                    .map(|p| p.coordinate.display())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            // Prefer live **r** probe label when present.
+            let (status, detail) = match row.nexus.as_str() {
+                "ok" => (
+                    "ok".into(),
+                    format!("nexus ok · local {}", row.version),
+                ),
+                "newer" => (
+                    "warn".into(),
+                    format!("newer on nexus · local {}", row.version),
+                ),
+                "miss" | "?" => (
+                    "warn".into(),
+                    format!("nexus {} · local {}", row.nexus, row.version),
+                ),
+                "—" | "" => (
+                    "unknown".into(),
+                    format!(
+                        "local {} — press r to probe Maven repo (not built locally)",
+                        row.version
+                    ),
+                ),
+                other => (
+                    "unknown".into(),
+                    format!("nexus {other} · local {}", row.version),
+                ),
+            };
+            lib_checks.push(LibNexusRow {
+                project_id: consumer_id.clone(),
+                project_name: row.name.clone(),
+                local_version: row.version.clone(),
+                produces: produces_s,
+                status,
+                detail,
+            });
+            continue;
+        }
+
+        // Services (or skaffold deployables): executable pipeline.
+        n_services += 1;
+        let gradle_dir = row.gradle_project_dir().to_path_buf();
+        let skaffold_file = row.skaffold_path.clone();
+
+        // git pull (skipped at spawn if no git root — mark skip)
+        steps.push(CascadeStep {
+            kind: CascadeStepKind::GitPull,
+            project_id: consumer_id.clone(),
+            project_name: row.name.clone(),
+            project_path: row.path.clone(),
+            gradle_dir: gradle_dir.clone(),
+            skaffold_file: skaffold_file.clone(),
+            status: CascadeStepStatus::Pending,
+            job_id: None,
+        });
+
+        if !clean_tasks.is_empty() {
+            steps.push(CascadeStep {
+                kind: CascadeStepKind::Gradle {
+                    tasks: clean_tasks.clone(),
+                    force_latest_snapshots: false,
+                },
+                project_id: consumer_id.clone(),
+                project_name: row.name.clone(),
+                project_path: row.path.clone(),
+                gradle_dir: gradle_dir.clone(),
+                skaffold_file: skaffold_file.clone(),
+                status: CascadeStepStatus::Pending,
+                job_id: None,
+            });
+        }
+
         steps.push(CascadeStep {
             kind: CascadeStepKind::Gradle {
-                tasks: consumer_gradle.clone(),
+                tasks: build_tasks.clone(),
                 force_latest_snapshots: force_snaps,
             },
             project_id: consumer_id.clone(),
             project_name: row.name.clone(),
             project_path: row.path.clone(),
-            gradle_dir: row.gradle_project_dir().to_path_buf(),
-            skaffold_file: row.skaffold_path.clone(),
+            gradle_dir: gradle_dir.clone(),
+            skaffold_file: skaffold_file.clone(),
             status: CascadeStepStatus::Pending,
             job_id: None,
         });
 
-        if include_skaffold && (row.has_skaffold || row.skaffold_path.is_some()) {
-            let skaffold_file = row.skaffold_path.clone();
-            for sub in &consumer_skaffold {
+        if crate::deploy::cascade_skaffold_ok(row, config) {
+            for sub in skaffold_redeploy_steps() {
                 steps.push(CascadeStep {
                     kind: CascadeStepKind::Skaffold {
-                        subcommand: sub.clone(),
+                        subcommand: (*sub).to_string(),
                     },
                     project_id: consumer_id.clone(),
                     project_name: row.name.clone(),
                     project_path: row.path.clone(),
-                    gradle_dir: row.gradle_project_dir().to_path_buf(),
+                    gradle_dir: gradle_dir.clone(),
                     skaffold_file: skaffold_file.clone(),
                     status: CascadeStepStatus::Pending,
                     job_id: None,
                 });
             }
+        } else if row.has_skaffold || row.skaffold_path.is_some() {
+            let mode = crate::deploy::effective_deploy_mode(row, config).label();
+            warnings.push(format!(
+                "won’t skaffold {} (deploy={mode}) — pull/clean/build only",
+                row.name
+            ));
+        } else {
+            warnings.push(format!(
+                "{} has no skaffold — pull/clean/build only",
+                row.name
+            ));
         }
     }
 
-    // Range mismatch warnings for published coords
-    let mut warnings = Vec::new();
+    if lib_checks.is_empty() && steps.is_empty() {
+        return Err(format!(
+            "nothing actionable depends on {} — no services to redeploy",
+            source.name
+        ));
+    }
+
+    if !lib_checks.is_empty() {
+        warnings.push(format!(
+            "{} child lib(s): not built locally — must already be on Nexus (or p them yourself)",
+            lib_checks.len()
+        ));
+        if lib_checks.iter().any(|l| l.status == "unknown") {
+            warnings.push(
+                "press r to probe Maven (from Gradle settings/build scripts)".into(),
+            );
+        }
+    }
+
+    if n_services > 0 {
+        warnings.push(format!(
+            "{n_services} service(s): git pull → clean → build (snap) → skaffold delete→run"
+        ));
+    }
+
     let produces = graph.produces_of_id(&source_id);
     for prod in produces {
         let ver = if prod.version.is_empty() || prod.version == "—" {
@@ -456,40 +591,71 @@ fn build_publish_cascade(
         }
     }
 
-    if force_snaps && !consumers.is_empty() {
-        warnings.push(
-            "consumer gradle uses tako init script (cacheChangingModulesFor 0) so SNAPSHOTs re-resolve"
-                .into(),
-        );
-    }
-
-    let max_p = config.cascade.max_parallel.max(1);
-    if max_p > 1 && !consumers.is_empty() {
-        warnings.push(format!(
-            "up to {max_p} consumer steps in parallel after publish (per-project order preserved)"
-        ));
-    }
-
-    if produces.is_empty() && consumers.is_empty() {
-        warnings.push(
-            "no produces/depends edges found — plan is publish-only; re-scan if graph is stale"
-                .into(),
-        );
-    } else if consumers.is_empty() {
-        warnings.push("no consumers matched (range/project deps) — publish only".into());
-    }
-
-    let recipe = if include_skaffold {
-        RECIPE_PUBLISH_AND_REDEPLOY
-    } else {
-        RECIPE_PUBLISH_AND_REBUILD
-    };
-
     Ok(CascadePlan {
-        recipe: recipe.into(),
+        recipe: RECIPE_UPDATE_DEPENDENTS.into(),
         source_id,
         source_name: source.name.clone(),
         source_version: source.version.clone(),
+        lib_checks,
+        steps,
+        cursor: 0,
+        warnings,
+        executing: false,
+        active_jobs: std::collections::HashMap::new(),
+    })
+}
+
+/// **u**: skaffold delete then run for the cursor project only.
+pub fn build_skaffold_redeploy(
+    projects: &[ProjectRow],
+    source_index: usize,
+    config: &Config,
+) -> Result<CascadePlan, String> {
+    let source = projects
+        .get(source_index)
+        .ok_or_else(|| "no project selected".to_string())?;
+    if source.skaffold_path.is_none() && !source.has_skaffold {
+        return Err(format!("no skaffold file: {}", source.name));
+    }
+    let mode = crate::deploy::effective_deploy_mode(source, config);
+    if mode == crate::config::DeployMode::Manual {
+        return Err(format!(
+            "deploy mode manual for {} — skaffold disabled",
+            source.name
+        ));
+    }
+    // Argo: still allow plan but caller should confirm; we include steps either way
+    // if has skaffold (guard is in app before open, or confirm overlay).
+
+    let source_id = source.name.clone();
+    let mut steps = Vec::new();
+    let mut warnings = Vec::new();
+    let skaffold_file = source.skaffold_path.clone();
+    for sub in skaffold_redeploy_steps() {
+        steps.push(CascadeStep {
+            kind: CascadeStepKind::Skaffold {
+                subcommand: (*sub).to_string(),
+            },
+            project_id: source_id.clone(),
+            project_name: source.name.clone(),
+            project_path: source.path.clone(),
+            gradle_dir: source.gradle_project_dir().to_path_buf(),
+            skaffold_file: skaffold_file.clone(),
+            status: CascadeStepStatus::Pending,
+            job_id: None,
+        });
+    }
+    if source.deploy_owner.as_deref() == Some("argocd") || mode == crate::config::DeployMode::Argocd
+    {
+        warnings.push("project looks Argo-managed — confirm carefully".into());
+    }
+
+    Ok(CascadePlan {
+        recipe: RECIPE_SKAFFOLD_REDEPLOY.into(),
+        source_id,
+        source_name: source.name.clone(),
+        source_version: source.version.clone(),
+        lib_checks: vec![],
         steps,
         cursor: 0,
         warnings,
@@ -538,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_publish_then_consumer_build_and_skaffold() {
+    fn plan_update_dependents_build_and_skaffold_delete_run() {
         let discovered = vec![
             proj(
                 "common-lib",
@@ -596,47 +762,31 @@ mod tests {
         let projects: Vec<ProjectRow> = discovered.iter().map(DiscoveredProject::to_row).collect();
         let config = Config::default();
 
-        let plan =
-            build_publish_and_redeploy(&projects, &graph, 0, &config).expect("plan builds");
+        let plan = build_update_dependents(&projects, &graph, 0, &config).expect("plan builds");
 
-        assert_eq!(plan.recipe, RECIPE_PUBLISH_AND_REDEPLOY);
+        assert_eq!(plan.recipe, RECIPE_UPDATE_DEPENDENTS);
         assert_eq!(plan.source_name, "common-lib");
-        assert_eq!(plan.source_version, "1.4.2");
+        // Services only: 2 × (pull + clean + build + delete + run) = 10
+        assert_eq!(
+            plan.steps.len(),
+            10,
+            "steps: {:?}",
+            plan.steps.iter().map(|s| s.step_label()).collect::<Vec<_>>()
+        );
+        assert!(plan.lib_checks.is_empty(), "no intermediate libs in this fixture");
 
-        // source publish + 2 consumers × (build + delete + run) = 1 + 6 = 7
-        assert_eq!(plan.steps.len(), 7, "steps: {:?}", plan.steps.iter().map(|s| s.step_label()).collect::<Vec<_>>());
-
-        // Step 1: clean build publish on common-lib (no snap init on publisher)
+        // First service block starts with git pull
+        assert_eq!(plan.steps[0].project_name, "orders-api");
+        assert!(matches!(plan.steps[0].kind, CascadeStepKind::GitPull));
         assert!(matches!(
-            &plan.steps[0].kind,
-            CascadeStepKind::Gradle {
-                tasks,
-                force_latest_snapshots: false
-            } if tasks == &["clean".to_string(), "build".into(), "publish".into()]
-        ));
-        assert_eq!(plan.steps[0].project_name, "common-lib");
-
-        // Consumers alphabetical: orders-api, payments-api
-        assert_eq!(plan.steps[1].project_name, "orders-api");
-        assert!(matches!(
-            &plan.steps[1].kind,
-            CascadeStepKind::Gradle {
-                tasks,
-                force_latest_snapshots: true
-            } if tasks == &["build".to_string()]
-        ));
-        assert!(matches!(
-            &plan.steps[2].kind,
+            &plan.steps[3].kind,
             CascadeStepKind::Skaffold { subcommand } if subcommand == "delete"
         ));
         assert!(matches!(
-            &plan.steps[3].kind,
+            &plan.steps[4].kind,
             CascadeStepKind::Skaffold { subcommand } if subcommand == "run"
         ));
 
-        assert_eq!(plan.steps[4].project_name, "payments-api");
-
-        // Range exclusion warning for legacy-api
         assert!(
             plan.warnings.iter().any(|w| w.contains("legacy-api") && w.contains("1.4.2")),
             "warnings: {:?}",
@@ -646,52 +796,106 @@ mod tests {
     }
 
     #[test]
-    fn plan_rebuild_only_skips_skaffold() {
-        let discovered = vec![
-            proj(
-                "common-lib",
-                "1.4.2",
-                ProjectKind::Library,
-                false,
-                vec![Produces::new(
-                    Coordinate::new("com.example", "common-lib"),
-                    "1.4.2",
-                )],
-                vec![],
-            ),
-            proj(
-                "payments-api",
-                "3.1.0",
-                ProjectKind::Service,
-                true,
-                vec![],
-                vec![DepReq::external(
-                    Coordinate::new("com.example", "common-lib"),
-                    VersionSpec::Range("[1.0.0, 2.0.0)".into()),
-                    "implementation",
-                    "libs.common.lib",
-                )],
-            ),
-        ];
+    fn update_dependents_lists_child_libs_without_building_them() {
+        // parent-lib → child-lib → service
+        let parent = proj(
+            "parent-lib",
+            "1.0.0",
+            ProjectKind::Library,
+            false,
+            vec![Produces::new(
+                Coordinate::new("com.example", "parent-lib"),
+                "1.0.0",
+            )],
+            vec![],
+        );
+        let child = proj(
+            "child-lib",
+            "2.0.0",
+            ProjectKind::Library,
+            false,
+            vec![Produces::new(
+                Coordinate::new("com.example", "child-lib"),
+                "2.0.0",
+            )],
+            vec![DepReq::external(
+                Coordinate::new("com.example", "parent-lib"),
+                VersionSpec::Range("[1.0.0,2.0.0)".into()),
+                "implementation",
+                "x",
+            )],
+        );
+        let svc = proj(
+            "svc",
+            "3.0.0",
+            ProjectKind::Service,
+            true,
+            vec![],
+            vec![DepReq::external(
+                Coordinate::new("com.example", "child-lib"),
+                VersionSpec::Range("[2.0.0,3.0.0)".into()),
+                "implementation",
+                "y",
+            )],
+        );
+        let discovered = vec![parent, child, svc];
         let graph = DependencyGraph::from_projects(&discovered);
         let projects: Vec<ProjectRow> = discovered.iter().map(DiscoveredProject::to_row).collect();
-        let plan =
-            build_publish_and_rebuild(&projects, &graph, 0, &Config::default()).expect("plan");
+        let plan = build_update_dependents(&projects, &graph, 0, &Config::default()).unwrap();
 
-        assert_eq!(plan.recipe, RECIPE_PUBLISH_AND_REBUILD);
-        // source publish + consumer build only (no delete/run)
-        assert_eq!(plan.steps.len(), 2, "steps: {:?}", plan.steps.iter().map(|s| s.step_label()).collect::<Vec<_>>());
+        assert_eq!(plan.lib_checks.len(), 1);
+        assert_eq!(plan.lib_checks[0].project_name, "child-lib");
+        // No gradle-only step for child-lib
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|s| s.project_name == "child-lib"),
+            "child lib must not be an executable step"
+        );
+        // Service still has work
+        assert!(plan.steps.iter().any(|s| s.project_name == "svc"));
+        assert!(plan.steps.iter().any(|s| matches!(s.kind, CascadeStepKind::GitPull)));
+    }
+
+    #[test]
+    fn plan_skaffold_redeploy_is_delete_then_run() {
+        let discovered = vec![proj(
+            "payments-api",
+            "3.1.0",
+            ProjectKind::Service,
+            true,
+            vec![],
+            vec![],
+        )];
+        let projects: Vec<ProjectRow> = discovered.iter().map(DiscoveredProject::to_row).collect();
+        let plan = build_skaffold_redeploy(&projects, 0, &Config::default()).expect("plan");
+        assert_eq!(plan.recipe, RECIPE_SKAFFOLD_REDEPLOY);
+        assert_eq!(plan.steps.len(), 2);
+        assert!(matches!(
+            &plan.steps[0].kind,
+            CascadeStepKind::Skaffold { subcommand } if subcommand == "delete"
+        ));
         assert!(matches!(
             &plan.steps[1].kind,
-            CascadeStepKind::Gradle {
-                force_latest_snapshots: true,
-                ..
-            }
+            CascadeStepKind::Skaffold { subcommand } if subcommand == "run"
         ));
-        assert!(plan
-            .warnings
-            .iter()
-            .any(|w| w.contains("cacheChangingModulesFor")));
+    }
+
+    #[test]
+    fn update_dependents_errors_when_none() {
+        let discovered = vec![proj(
+            "payments-api",
+            "3.1.0",
+            ProjectKind::Service,
+            true,
+            vec![],
+            vec![],
+        )];
+        let graph = DependencyGraph::from_projects(&discovered);
+        let projects: Vec<ProjectRow> = discovered.iter().map(DiscoveredProject::to_row).collect();
+        let err = build_update_dependents(&projects, &graph, 0, &Config::default()).unwrap_err();
+        assert!(err.contains("nothing depends"), "{err}");
     }
 
     #[test]
@@ -736,29 +940,39 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = build_publish_and_redeploy(&projects, &graph, 0, &config).unwrap();
-        // source: clean assemble publishToMavenLocal
-        match &plan.steps[0].kind {
-            CascadeStepKind::Gradle { tasks, .. } => {
-                assert_eq!(tasks, &["clean", "assemble", "publishToMavenLocal"]);
-            }
-            _ => panic!("expected gradle"),
-        }
-        // consumer: check only (no skaffold)
-        assert_eq!(plan.steps.len(), 2);
-        match &plan.steps[1].kind {
-            CascadeStepKind::Gradle { tasks, .. } => assert_eq!(tasks, &["check"]),
-            _ => panic!("expected gradle"),
-        }
+        let plan = build_update_dependents(&projects, &graph, 0, &config).unwrap();
+        // service: pull + clean + check (no skaffold on svc)
+        assert!(
+            plan.steps.len() >= 2,
+            "steps: {:?}",
+            plan.steps.iter().map(|s| s.step_label()).collect::<Vec<_>>()
+        );
+        assert!(matches!(plan.steps[0].kind, CascadeStepKind::GitPull));
+        // last gradle step should be the configured consumer task "check"
+        let gradle = plan
+            .steps
+            .iter()
+            .filter_map(|s| match &s.kind {
+                CascadeStepKind::Gradle { tasks, force_latest_snapshots } => {
+                    Some((tasks.as_slice(), *force_latest_snapshots))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            gradle.iter().any(|(t, snap)| *t == ["check".to_string()].as_slice() && *snap),
+            "expected force-snap check: {gradle:?}"
+        );
     }
 
     #[test]
     fn finish_job_and_ready_after_source() {
         let mut plan = CascadePlan {
-            recipe: RECIPE_PUBLISH_AND_REDEPLOY.into(),
+            recipe: RECIPE_UPDATE_DEPENDENTS.into(),
             source_id: "lib".into(),
             source_name: "lib".into(),
             source_version: "1.0".into(),
+            lib_checks: vec![],
             steps: vec![
                 CascadeStep {
                     kind: CascadeStepKind::Gradle {
@@ -834,10 +1048,11 @@ mod tests {
     #[test]
     fn per_project_order_blocks_skaffold_until_build() {
         let mut plan = CascadePlan {
-            recipe: RECIPE_PUBLISH_AND_REDEPLOY.into(),
+            recipe: RECIPE_UPDATE_DEPENDENTS.into(),
             source_id: "lib".into(),
             source_name: "lib".into(),
             source_version: "1".into(),
+            lib_checks: vec![],
             steps: vec![
                 CascadeStep {
                     kind: CascadeStepKind::Gradle {
@@ -892,10 +1107,11 @@ mod tests {
     #[test]
     fn unrelated_job_id_ignored() {
         let mut plan = CascadePlan {
-            recipe: RECIPE_PUBLISH_AND_REDEPLOY.into(),
+            recipe: RECIPE_UPDATE_DEPENDENTS.into(),
             source_id: "lib".into(),
             source_name: "lib".into(),
             source_version: "1".into(),
+            lib_checks: vec![],
             steps: vec![],
             cursor: 0,
             warnings: vec![],

@@ -22,8 +22,8 @@
 //! |-------|------------|
 //! | Selected project | `selected_row` |
 //! | Hover | `hover_row` |
-//! | Dependency (uses) | `secondary` (cyan) |
-//! | Dependent (used by) | `warning` |
+//! | Needs (depends on) | `secondary` (cyan) |
+//! | Needed by (dependents) | `warning` |
 //! | Skaffold running | `success` |
 //! | Git dirty / pull fail | `warning` / `error` |
 

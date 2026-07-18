@@ -48,7 +48,7 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if error {
         app.theme.error.add_modifier(Modifier::BOLD)
     } else {
-        // In-flight / neutral (scanning…, build…, cascade…)
+        // In-flight / neutral (scanning…, build…, plan…)
         app.theme.secondary.add_modifier(Modifier::BOLD)
     };
 
@@ -72,7 +72,10 @@ fn is_success_status(lower: &str) -> bool {
         || (lower.starts_with("build")
             && (lower.contains("ok") || lower.contains("done") || lower.contains("finished")))
         || (lower.starts_with("publish")
-            && (lower.contains("ok") || lower.contains("done") || lower.contains("finished")))
+            && (lower.contains("ok")
+                || lower.contains("done")
+                || lower.contains("finished")
+                || lower.contains("complete")))
         || (lower.starts_with("scan")
             && (lower.contains("ok")
                 || lower.contains("done")
@@ -80,9 +83,21 @@ fn is_success_status(lower: &str) -> bool {
                 || lower.contains("complete")))
         || (lower.starts_with("cascade")
             && (lower.contains("ok") || lower.contains("done") || lower.contains("finished")))
+        || (lower.starts_with("plan ")
+            && (lower.contains("ok")
+                || lower.contains("done")
+                || lower.contains("finished")
+                || lower.contains("complete")))
+        || (lower.starts_with("lib update")
+            && (lower.contains("ok")
+                || lower.contains("done")
+                || lower.contains("finished")
+                || lower.contains("complete")))
         || (lower.starts_with("skaffold")
             && (lower.contains("started") || lower.contains("ok") || lower.contains("stopped")))
         || lower.starts_with("added root")
         || lower.starts_with("updated root")
         || lower.starts_with("deleted root")
+        || (lower.contains("complete:")
+            && (lower.contains("ok") || lower.contains("steps ok")))
 }

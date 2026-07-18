@@ -97,6 +97,12 @@ impl DiscoveredProject {
             deployed_version: None,
             drift,
             deploy_owner: None,
+            git_sync: if self.git_dirty {
+                "dirty".into()
+            } else {
+                "—".into()
+            },
+            nexus: "—".into(),
         }
     }
 }
@@ -154,12 +160,14 @@ pub fn scan_workspace(opts: &ScanOptions) -> Result<Vec<DiscoveredProject>, Stri
 
 /// True when `project` matches any entry in `[scan].exclude`.
 ///
-/// Patterns (after `~/` expand):
-/// - exact project **name** or **id** (e.g. `payments-api`, `group/leaf`)
-/// - **leaf** name only (`common-lib` matches `libs/common-lib`)
-/// - absolute **path** prefix/exact
-/// - path **suffix** / substring (e.g. `services/legacy`)
-/// - simple globs with `*` (one segment) and `**` (any path)
+/// **Exact string match only** (no substring / prefix / leaf fallback):
+/// - project **name** equals pattern (e.g. `avro-schemas` does **not** match
+///   `avro-schemas/cats`)
+/// - project **id** equals pattern
+/// - absolute path equals pattern (after `~/` expand)
+///
+/// Patterns containing `*` / `**` still use simple globs against name, id, or
+/// full path only (not leaf-only).
 pub fn project_is_excluded(project: &DiscoveredProject, exclude: &[String]) -> bool {
     if exclude.is_empty() {
         return false;
@@ -167,7 +175,6 @@ pub fn project_is_excluded(project: &DiscoveredProject, exclude: &[String]) -> b
     let path_str = project.path.to_string_lossy();
     let name = project.name.as_str();
     let id = project.id.as_str();
-    let leaf = name.rsplit('/').next().unwrap_or(name);
 
     for raw in exclude {
         let pat = raw.trim();
@@ -182,29 +189,17 @@ pub fn project_is_excluded(project: &DiscoveredProject, exclude: &[String]) -> b
             if glob_match(pat_s, name)
                 || glob_match(pat_s, id)
                 || glob_match(pat_s, path_str.as_ref())
-                || glob_match(pat_s, leaf)
             {
                 return true;
             }
             continue;
         }
 
-        if name == pat_s || id == pat_s || leaf == pat_s {
+        // Exact only — never prefix/substring (so avro-schemas ≠ avro-schemas/cats).
+        if name == pat_s || id == pat_s || path_str.as_ref() == pat_s {
             return true;
         }
-        // Absolute path: prefix or exact
-        if expanded.is_absolute() {
-            if project.path == expanded || project.path.starts_with(&expanded) {
-                return true;
-            }
-        }
-        // Relative path fragment
-        if path_str.ends_with(pat_s)
-            || path_str.contains(&format!("/{pat_s}/"))
-            || path_str.contains(&format!("/{pat_s}"))
-            || name.ends_with(pat_s)
-            || name.contains(&format!("/{pat_s}"))
-        {
+        if expanded.is_absolute() && project.path == expanded {
             return true;
         }
     }
@@ -1215,8 +1210,53 @@ plugins { `java-library` }
     }
 
     #[test]
-    fn project_is_excluded_by_name_path_and_glob() {
-        let mut p = DiscoveredProject {
+    fn project_is_excluded_exact_only() {
+        let nested = DiscoveredProject {
+            id: "avro-schemas/cats".into(),
+            path: PathBuf::from("/ws/avro-schemas/cats"),
+            git_root: None,
+            name: "avro-schemas/cats".into(),
+            kind: ProjectKind::Avro,
+            version: "1.0.0".into(),
+            branch: "main".into(),
+            git_dirty: false,
+            has_skaffold: false,
+            skaffold_files: vec![],
+            gradle_root: None,
+            folder_group: "avro-schemas".into(),
+            status: "idle".into(),
+            depends: vec![],
+            produces: vec![],
+        };
+        // Parent fragment must NOT exclude child project.
+        assert!(!project_is_excluded(&nested, &["avro-schemas".into()]));
+        assert!(!project_is_excluded(&nested, &["cats".into()])); // not leaf match
+        assert!(project_is_excluded(&nested, &["avro-schemas/cats".into()]));
+        assert!(project_is_excluded(
+            &nested,
+            &["/ws/avro-schemas/cats".into()]
+        ));
+
+        let parent = DiscoveredProject {
+            id: "avro-schemas".into(),
+            path: PathBuf::from("/ws/avro-schemas"),
+            git_root: None,
+            name: "avro-schemas".into(),
+            kind: ProjectKind::Unknown,
+            version: "—".into(),
+            branch: "main".into(),
+            git_dirty: false,
+            has_skaffold: false,
+            skaffold_files: vec![],
+            gradle_root: None,
+            folder_group: "avro-schemas".into(),
+            status: "idle".into(),
+            depends: vec![],
+            produces: vec![],
+        };
+        assert!(project_is_excluded(&parent, &["avro-schemas".into()]));
+
+        let service = DiscoveredProject {
             id: "services/legacy-api".into(),
             path: PathBuf::from("/ws/services/legacy-api"),
             git_root: None,
@@ -1233,19 +1273,12 @@ plugins { `java-library` }
             depends: vec![],
             produces: vec![],
         };
-        assert!(project_is_excluded(&p, &["legacy-api".into()]));
-        assert!(project_is_excluded(&p, &["services/legacy-api".into()]));
-        assert!(project_is_excluded(&p, &["/ws/services/legacy-api".into()]));
-        assert!(project_is_excluded(&p, &["**/legacy-api".into()]));
-        assert!(project_is_excluded(&p, &["services/*".into()]));
-        assert!(!project_is_excluded(&p, &["orders-api".into()]));
-        assert!(!project_is_excluded(&p, &[]));
-
-        p.name = "payments-api".into();
-        p.id = "payments-api".into();
-        p.path = PathBuf::from("/ws/payments-api");
-        assert!(project_is_excluded(&p, &["payments-api".into()]));
-        assert!(!project_is_excluded(&p, &["legacy-api".into()]));
+        assert!(!project_is_excluded(&service, &["legacy-api".into()]));
+        assert!(project_is_excluded(&service, &["services/legacy-api".into()]));
+        assert!(project_is_excluded(&service, &["services/*".into()]));
+        assert!(project_is_excluded(&service, &["**/legacy-api".into()]));
+        assert!(!project_is_excluded(&service, &["orders-api".into()]));
+        assert!(!project_is_excluded(&service, &[]));
     }
 
     #[test]

@@ -138,20 +138,28 @@ impl SettingId {
             SettingId::ScanMaxDepth => "Directory depth under each scan root",
             SettingId::ScanIgnore => "Comma-separated dir globs to skip while walking",
             SettingId::GradleCommand => "gradle binary on PATH or absolute path",
-            SettingId::GradleTasksBuild => "Tasks for b / bulk build (comma-separated)",
-            SettingId::GradleTasksClean => "Tasks for c / bulk clean",
-            SettingId::GradleTasksPublish => "Tasks for p publish",
-            SettingId::GradleForceSnapshots => "Init script on B/P consumer builds (SNAPSHOT refresh)",
+            SettingId::GradleTasksBuild => "Gradle tasks for b build (comma-separated)",
+            SettingId::GradleTasksClean => "Gradle tasks for c clean",
+            SettingId::GradleTasksPublish => "Gradle tasks for p publish",
+            SettingId::GradleForceSnapshots => {
+                "On R/U/C rebuilds: force latest SNAPSHOT from the repo"
+            }
             SettingId::SkaffoldCommand => "skaffold binary",
             SettingId::SkaffoldProfile => "Default -p profile (empty = none)",
             SettingId::SkaffoldDevArgs => "Extra args for skaffold dev",
             SettingId::SkaffoldDebugArgs => "Extra args for skaffold debug",
             SettingId::GitPullFfOnly => "git pull --ff-only (recommended)",
             SettingId::GitPullArgs => "Extra args after pull",
-            SettingId::CascadeConsumerGradle => "Gradle tasks on cascade consumers",
-            SettingId::CascadeConsumerSkaffold => "Skaffold subcommands on consumers (P)",
-            SettingId::CascadeMaxParallel => "Max parallel consumer jobs after publish (1=serial)",
-            SettingId::KubeEnabled => "Probe cluster for deployed versions (K key)",
+            SettingId::CascadeConsumerGradle => {
+                "Gradle tasks for dependents on R/U (projects that need the lib)"
+            }
+            SettingId::CascadeConsumerSkaffold => {
+                "Skaffold steps for those dependents on R/U (e.g. delete,run)"
+            }
+            SettingId::CascadeMaxParallel => {
+                "How many dependent steps to run at once on R/U (1 = one-by-one)"
+            }
+            SettingId::KubeEnabled => "Compare local vs cluster versions (K key)",
             SettingId::KubeContext => "kubectl --context (empty = current)",
             SettingId::KubeNamespaces => "Namespaces to search (comma-separated)",
             SettingId::KubeVersionSource => "auto | label:… | image_tag | annotation:… | env:…",

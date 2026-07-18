@@ -542,19 +542,10 @@ pub fn clear_deployed(projects: &mut [ProjectRow]) {
     }
 }
 
-/// Prefer a short exclude pattern for a project (leaf name, or full name if nested).
+/// Exact inventory name/id to add when excluding from the project browser.
+/// Always the full display name so nested rows are not over-matched.
 pub fn exclude_pattern_for(project: &ProjectRow) -> String {
-    let leaf = project
-        .name
-        .rsplit('/')
-        .next()
-        .unwrap_or(project.name.as_str());
-    // Nested inventory names keep the relative id so we don't over-exclude.
-    if project.name.contains('/') && project.name != leaf {
-        project.name.clone()
-    } else {
-        leaf.to_string()
-    }
+    project.name.clone()
 }
 
 #[allow(dead_code)]

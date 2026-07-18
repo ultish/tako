@@ -33,6 +33,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(main);
 
+    // Panel focus hit targets (row/log clicks registered after and win).
+    app.register_click(
+        chunks[0].x,
+        chunks[0].y,
+        chunks[0].width,
+        chunks[0].height,
+        Action::FocusJobsList,
+    );
+    app.register_click(
+        chunks[1].x,
+        chunks[1].y,
+        chunks[1].width,
+        chunks[1].height,
+        Action::FocusJobsLog,
+    );
+
     render_job_list(frame, app, chunks[0]);
     render_log_pane(frame, app, chunks[1]);
 
@@ -53,11 +69,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_empty(frame: &mut Frame, app: &App, area: Rect) {
     let body = "No jobs yet.\n\n\
-         From Projects (1), run:\n\
-           b build · c clean · p publish\n\
-           d dev · D debug · x delete · u run\n\
-           G git pull\n\n\
-         Live logs appear here; Esc cancels the focused running job.";
+         From Projects (1):\n\
+           Shared:  b/B build  ·  c clean  ·  p publish  ·  v/V bump  ·  G pull\n\
+           Lib:     U update dependents  ·  r stats  ·  w scan\n\
+           Deploy:  u delete→run  ·  x delete\n\n\
+         Live logs appear here. Esc cancels the focused running job.";
     let message = Paragraph::new(body)
         .style(app.theme.status)
         .wrap(Wrap { trim: false })
@@ -92,6 +108,8 @@ fn render_job_list(frame: &mut Frame, app: &App, area: Rect) {
         JobsFocus::Log => "Jobs",
     };
 
+    // selectable=false: avoid table_nav SelectRow; we register our own so focus
+    // also moves to the list panel.
     render_selectable_list(
         frame,
         app,
@@ -100,7 +118,7 @@ fn render_job_list(frame: &mut Frame, app: &App, area: Rect) {
         &items,
         Some(&["Id", "Project", "Kind", "St", "Time"]),
         app.selected_job,
-        true,
+        false,
     );
 
     // Click regions for job rows (SelectRow index = job index).

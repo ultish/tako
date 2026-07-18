@@ -44,6 +44,66 @@ pub struct UiConfig {
     /// Top banner animation (`wave` | `ms` | `fps` | `off`). Default `wave`.
     #[serde(default)]
     pub banner_mode: BannerMode,
+    /// Favorite project names/ids (pinned to top of Projects list). **F** toggles.
+    #[serde(default)]
+    pub favorites: Vec<String>,
+}
+
+/// How a project is deployed to the cluster (overrides / Argo guard).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployMode {
+    /// Infer: skaffold file → skaffold; else manual. Cluster Argo labels upgrade to argocd.
+    #[default]
+    Auto,
+    Skaffold,
+    Argocd,
+    Manual,
+}
+
+impl DeployMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeployMode::Auto => "auto",
+            DeployMode::Skaffold => "skaffold",
+            DeployMode::Argocd => "argocd",
+            DeployMode::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(DeployMode::Auto),
+            "skaffold" | "sk" => Some(DeployMode::Skaffold),
+            "argocd" | "argo" => Some(DeployMode::Argocd),
+            "manual" | "none" => Some(DeployMode::Manual),
+            _ => None,
+        }
+    }
+}
+
+fn default_true_deploy() -> bool {
+    true
+}
+
+/// Deploy ownership settings under `[deploy]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeployConfig {
+    /// When true (default), skaffold on Argo-owned projects requires confirm.
+    #[serde(default = "default_true_deploy")]
+    pub argo_guard: bool,
+    /// Exact project name/id → deploy mode override (`skaffold` / `argocd` / `manual`).
+    #[serde(default)]
+    pub modes: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            argo_guard: true,
+            modes: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 fn default_max_depth() -> usize {
@@ -268,6 +328,20 @@ impl Default for KubeConfig {
     }
 }
 
+/// Optional Maven repo override under `[nexus]`.
+///
+/// By default tako finds repo URLs from each project's **Gradle** scripts
+/// (`settings.gradle(.kts)` / `build.gradle(.kts)` — `maven { url = … }`,
+/// `mavenCentral()`, etc.), then falls back to `~/.m2/settings.xml`.
+/// Only set `repository_url` if you need to force one base URL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NexusConfig {
+    /// Optional override base URL. Empty → discover from Gradle scripts / m2.
+    /// Example: `https://nexus.example.com/repository/maven-public`
+    #[serde(default)]
+    pub repository_url: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
@@ -284,7 +358,13 @@ pub struct Config {
     /// Phase 2 cluster version compare (`kubectl` read-only).
     #[serde(default)]
     pub kube: KubeConfig,
-    /// TUI appearance (`theme`, `banner_mode`). Absent section → defaults.
+    /// Deploy mode overrides + Argo skaffold guard.
+    #[serde(default)]
+    pub deploy: DeployConfig,
+    /// Maven/Nexus version probe for library rows.
+    #[serde(default)]
+    pub nexus: NexusConfig,
+    /// TUI appearance (`theme`, `banner_mode`, `favorites`). Absent section → defaults.
     #[serde(default)]
     pub ui: UiConfig,
 }
@@ -391,9 +471,12 @@ mod tests {
                 version_source: "label:app.kubernetes.io/version".into(),
                 command: "kubectl".into(),
             },
+            deploy: DeployConfig::default(),
+            nexus: NexusConfig::default(),
             ui: UiConfig {
                 theme: ThemeName::Light,
                 banner_mode: BannerMode::Fps,
+                favorites: vec!["payments-api".into()],
             },
         };
         let serialized = toml::to_string_pretty(&config).expect("serialize");
@@ -516,9 +599,12 @@ mod tests {
             git: GitConfig::default(),
             cascade: CascadeConfig::default(),
             kube: KubeConfig::default(),
+            deploy: DeployConfig::default(),
+            nexus: NexusConfig::default(),
             ui: UiConfig {
                 theme: ThemeName::Light,
                 banner_mode: BannerMode::Ms,
+                favorites: vec![],
             },
         };
         save(&path, &config).expect("save");

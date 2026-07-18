@@ -36,6 +36,13 @@ pub enum AppEvent {
     KubeProbeFinished {
         batch: crate::kube::ProbeBatch,
     },
+
+    /// Git remote lag + Nexus version probe finished (**r** stats).
+    RepoStatsFinished {
+        git: Vec<(std::path::PathBuf, crate::git::GitInfo)>,
+        nexus: crate::nexus::NexusBatch,
+        error: Option<String>,
+    },
 }
 
 /// User- or timer-driven state transitions, dispatched by the render loop into
@@ -67,6 +74,8 @@ pub enum Action {
     CycleTheme,
     /// Toggle the global keybind help overlay (`?`).
     ToggleHelp,
+    /// Cycle help page: workflows ↔ keys (`Tab` while help is open).
+    CycleHelpPage,
     /// Dismiss the startup splash.
     DismissSplash,
     /// Top-level view switcher (digits 1/2/3).
@@ -99,8 +108,16 @@ pub enum Action {
     CancelDeleteExclude,
     /// Toggle Workspace focus between scan roots and excludes (`Tab`).
     ToggleWorkspacePanel,
+    /// Mouse: focus the scan-roots list (click anywhere on that panel).
+    FocusWorkspaceRoots,
+    /// Mouse: focus the project-excludes list (click anywhere on that panel).
+    FocusWorkspaceExcludes,
     /// Click an exclude row (absolute index into `config.scan.exclude`).
     SelectExcludeRow(usize),
+    /// Mouse: focus the jobs list panel.
+    FocusJobsList,
+    /// Mouse: focus the job log panel.
+    FocusJobsLog,
     /// Dismiss the root path editor without saving.
     CancelRootEditor,
     /// Insert a character into the root path field.
@@ -114,50 +131,75 @@ pub enum Action {
     /// Save the root path editor (Enter).
     SaveRoot,
 
-    // ── M3 single-project exec (project browser focused) ───────────────────
-    /// Gradle `build` on the selected project (`b`); bulk when multi-select non-empty.
+    // ── Project exec (shared) ──────────────────────────────────────────────
+    /// Gradle `build` (`b`); bulk when multi-select non-empty.
     Build,
-    /// Open `publish_and_rebuild_consumers` plan: publish cursor, then rebuild
-    /// graph dependents (`B` / detail page). Sequential; no skaffold.
-    BuildWithDeps,
+    /// Gradle build forcing latest SNAPSHOT re-resolve (`B`).
+    BuildForce,
     /// Gradle `clean` (`c`); bulk when multi-select non-empty.
     Clean,
-    /// Gradle `publish` (`p`).
+    /// Gradle `publish` to Nexus (`p`).
     Publish,
-    /// `skaffold dev` (`d`).
-    SkaffoldDev,
-    /// `skaffold debug` (`D`).
-    SkaffoldDebug,
-    /// `skaffold delete` (`x`).
+    /// Skaffold **delete → run** for this project (`u`).
+    SkaffoldRedeploy,
+    /// Skaffold `delete` only (`x`).
     SkaffoldDelete,
-    /// `skaffold run` (`u`).
-    SkaffoldRun,
-    /// `git pull` (ff-only default) for the selected project's git root (`G`);
-    /// bulk: unique `git_root`s among multi-selected projects.
+    /// `git pull` (`G`); bulk: unique git roots among multi-selected.
     GitPull,
-    /// Toggle multi-select on the cursor project (`Space` on project browser).
+    /// Toggle multi-select (`Space`).
     ToggleMultiSelect,
-    /// Cancel the focused running job on the Jobs screen (also via Esc → Back).
+    /// Cancel the focused running job on the Jobs screen.
     #[allow(dead_code)]
     CancelJob,
-    /// Toggle Jobs list vs log pane focus (`Tab` on Jobs screen).
+    /// Toggle Jobs list vs log pane focus (`Tab` on Jobs).
     ToggleJobsFocus,
 
-    // ── M4 cascade recipes ─────────────────────────────────────────────────
-    /// Open `publish_and_redeploy_consumers` plan for the selected producer (`P`).
-    CascadePublish,
-    /// Confirm and start the open cascade plan (y/Enter).
+    // ── Multi-step recipes ─────────────────────────────────────────────────
+    /// **U**: update full dependent tree (build + skaffold delete→run unless Argo).
+    UpdateDependents,
+    /// Confirm and start the open plan (y/Enter).
     ConfirmCascadePlan,
-    /// Dismiss the cascade plan without running (n/Esc).
+    /// Dismiss the plan without running (n/Esc).
     CancelCascadePlan,
 
-    // ── Phase 2 kube ───────────────────────────────────────────────────────
-    /// Refresh deployed versions from the cluster (`K`).
+    // ── Stats / scan ───────────────────────────────────────────────────────
+    /// **r**: refresh stats (cluster probe when kube enabled; kind-aware status).
+    RefreshStats,
+    /// **K**: probe deployed versions from the cluster (same as part of stats).
     RefreshDeployedVersions,
-    /// Toggle "show only drift" filter on the project browser (`f`).
+    /// **w**: rescan workspace roots.
+    // (wired as Action::Refresh historically)
+    /// Toggle "show only drift" filter (`f`).
     ToggleDriftFilter,
-    /// Add cursor (or multi-selected) project(s) to `[scan].exclude` (`-`).
+    /// Hide projects from inventory (`-`).
     ExcludeSelectedProjects,
+
+    // ── Version bump ───────────────────────────────────────────────────────
+    /// **v**: bump **this** project's version.
+    OpenBumpVersion,
+    /// **V**: bump versions of projects that depend on this (manual).
+    OpenBumpDependents,
+    CycleBumpKind,
+    SetBumpKind(crate::version_bump::BumpKind),
+    ConfirmBumpDependents,
+    CancelBumpDependents,
+
+    // ── Browser helpers ────────────────────────────────────────────────────
+    /// Who needs this? (`i`).
+    ToggleImpact,
+    /// Toggle favorite pin for cursor project (`F`).
+    ToggleFavorite,
+    /// Start / focus project name filter (`/`).
+    StartProjectFilter,
+    /// Type into project filter.
+    ProjectFilterChar(char),
+    ProjectFilterBackspace,
+    /// Leave filter mode but keep query (Esc).
+    ClearProjectFilter,
+    /// Confirm Argo-guarded skaffold action (y).
+    ConfirmArgoSkaffold,
+    /// Cancel Argo-guarded skaffold (n).
+    CancelArgoSkaffold,
 
     // ── Settings screen ────────────────────────────────────────────────────
     /// Activate / toggle / open editor for the focused setting.
@@ -224,4 +266,6 @@ pub enum Command {
     CancelJob { id: u64 },
     /// Probe cluster Deployments for deployed versions (phase 2).
     ProbeKubeVersions,
+    /// Probe git remotes (fetch + lag) and Nexus maven-metadata (**r** stats).
+    ProbeRepoStats { fetch_git: bool },
 }

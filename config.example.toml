@@ -8,9 +8,10 @@
 roots = ["/Users/you/Developer/services", "/Users/you/Developer/libs"]
 max_depth = 6
 ignore = ["**/.git/**", "**/build/**", "**/node_modules/**"]
-# Drop specific projects from the inventory (still walk parents).
-# Match by leaf name, path fragment, absolute path, or simple globs:
-#   exclude = ["legacy-api", "services/sandbox", "**/tmp-*", "~/Developer/old"]
+# Drop specific projects from the inventory (exact name/id match only).
+#   exclude = ["avro-schemas"]           # not avro-schemas/cats
+#   exclude = ["services/legacy-api"]    # full inventory name
+#   exclude = ["**/tmp-*"]               # optional globs with *
 exclude = []
 
 [gradle]
@@ -18,8 +19,8 @@ exclude = []
 # command = "gradle"          # override if needed (absolute path ok)
 default_tasks_build = ["build"]
 default_tasks_publish = ["publish"]
-# Consumer steps of B/P inject an init script (cacheChangingModulesFor 0) so
-# just-published Nexus SNAPSHOTs re-resolve without --refresh-dependencies.
+# When rebuilding projects that depend on something you just published (B/P/U),
+# inject an init script so latest SNAPSHOTs are picked up (no --refresh-dependencies).
 force_latest_snapshots = true
 
 [skaffold]
@@ -47,17 +48,27 @@ namespaces = ["default"]
 version_source = "auto"
 # command = "kubectl"
 
-# After publishing a lib/avro:
-#   B = publish → rebuild dependents (no skaffold)
-#   P = publish → rebuild + skaffold delete/run per consumer
+# Multi-step: U = update full dependent tree (build + skaffold delete→run unless Argo).
+# u on a service = delete→run for that project only. Always delete before run.
 [cascade]
 default_consumer_gradle = ["build"]
-default_consumer_skaffold = ["delete", "run"]   # or ["dev"] for interactive
-# After source publish, run up to N consumer steps at once (per-project order
-# kept: build then skaffold for the same service). 1 = fully sequential.
+default_consumer_skaffold = ["delete", "run"]
+# Up to N steps at once (order kept per project: build before skaffold). 1 = serial.
 max_parallel = 5
+
+# Who owns deploy in the cluster (Argo vs Skaffold). Favorites: F key or below.
+[deploy]
+argo_guard = true       # confirm before skaffold if the project is Argo-managed
+# modes = { "payments-api" = "argocd", "animals/cat" = "skaffold" }
+
+# Optional override only. By default **r** finds Maven repos from your Gradle
+# settings/build scripts (maven { url = uri("…") }, mavenCentral(), …), then
+# falls back to ~/.m2/settings.xml.
+# [nexus]
+# repository_url = "https://nexus.example.com/repository/maven-public"
 
 # TUI appearance (also set by A / T keys in the app, which write back here).
 [ui]
 theme = "dark"          # dark | light
 banner_mode = "off"     # wave | ms (ms/frame) | fps (paint capacity) | off
+# favorites = ["util-core", "animals/cat"]

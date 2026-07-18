@@ -138,7 +138,7 @@ impl DependencyGraph {
     }
 
     /// Project ids that depend on `project_id` (project edges + coord/range match
-    /// against this project's **current** produced version(s)).
+    /// against this project's **current** produced version(s)). Direct only.
     pub fn dependents_of(&self, project_id: &str) -> Vec<String> {
         let mut out: HashSet<String> = HashSet::new();
 
@@ -184,6 +184,122 @@ impl DependencyGraph {
         let mut v: Vec<String> = out.into_iter().collect();
         v.sort();
         v
+    }
+
+    /// All transitive dependents of `project_id`, in **build order**
+    /// (deeper/shared libs before services that need them).
+    ///
+    /// Uses direct [`dependents_of`] edges only (BFS closure), then topological
+    /// sort so that if A depends on B and both depend (transitively) on the
+    /// source, B is built before A.
+    pub fn dependents_transitive_topo(&self, project_id: &str) -> Vec<String> {
+        // Closure of all reachable dependents.
+        let mut all: HashSet<String> = HashSet::new();
+        let mut stack = self.dependents_of(project_id);
+        while let Some(id) = stack.pop() {
+            if !all.insert(id.clone()) {
+                continue;
+            }
+            for child in self.dependents_of(&id) {
+                if !all.contains(&child) {
+                    stack.push(child);
+                }
+            }
+        }
+        if all.is_empty() {
+            return vec![];
+        }
+
+        // Edge u → v means "u must build before v" when v depends on u (both in set).
+        // Kahn: indegree = number of deps still in the set.
+        let mut indegree: std::collections::BTreeMap<String, usize> = all
+            .iter()
+            .map(|id| (id.clone(), 0usize))
+            .collect();
+        let mut forward: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+
+        for id in &all {
+            for dep in self.dependencies_of(id) {
+                if all.contains(&dep) {
+                    // dep builds before id
+                    *indegree.entry(id.clone()).or_default() += 1;
+                    forward.entry(dep).or_default().push(id.clone());
+                }
+            }
+        }
+
+        let mut ready: Vec<String> = indegree
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ready.sort(); // stable alphabetical among roots
+
+        let mut ordered = Vec::with_capacity(all.len());
+        while let Some(id) = {
+            // pop front of sorted ready
+            if ready.is_empty() {
+                None
+            } else {
+                Some(ready.remove(0))
+            }
+        } {
+            ordered.push(id.clone());
+            if let Some(children) = forward.get(&id) {
+                let mut newly = Vec::new();
+                for child in children {
+                    if let Some(d) = indegree.get_mut(child) {
+                        *d = d.saturating_sub(1);
+                        if *d == 0 {
+                            newly.push(child.clone());
+                        }
+                    }
+                }
+                newly.sort();
+                for n in newly {
+                    if !ready.contains(&n) && !ordered.contains(&n) {
+                        ready.push(n);
+                    }
+                }
+                ready.sort();
+            }
+        }
+
+        // Cycle / incomplete: append any leftover alphabetically.
+        if ordered.len() < all.len() {
+            let mut rest: Vec<_> = all.into_iter().filter(|id| !ordered.contains(id)).collect();
+            rest.sort();
+            ordered.extend(rest);
+        }
+        ordered
+    }
+
+    /// Nested display lines for the full dependent tree (DFS, depth-first).
+    /// Each entry is `(depth, project_id)`.
+    pub fn dependents_tree(&self, project_id: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut visiting = HashSet::new();
+        self.dependents_tree_dfs(project_id, 0, &mut visiting, &mut out);
+        out
+    }
+
+    fn dependents_tree_dfs(
+        &self,
+        project_id: &str,
+        depth: usize,
+        visiting: &mut HashSet<String>,
+        out: &mut Vec<(usize, String)>,
+    ) {
+        let mut kids = self.dependents_of(project_id);
+        kids.sort();
+        for kid in kids {
+            out.push((depth, kid.clone()));
+            if visiting.insert(kid.clone()) {
+                self.dependents_tree_dfs(&kid, depth + 1, visiting, out);
+                visiting.remove(&kid);
+            }
+        }
     }
 
     /// Project ids that produce `coord` (exact G:A, else same artifact **name**).

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, Config};
 use crate::events::{Action, AppEvent, Command};
 use crate::exec::{
-    build_publish_and_rebuild, build_publish_and_redeploy, CascadePlan, CascadeStepKind,
+    build_skaffold_redeploy, build_update_dependents, CascadePlan, CascadeStepKind,
     CascadeStepStatus,
 };
 use crate::graph::DependencyGraph;
@@ -23,6 +23,10 @@ use crate::jobs::{Job, JobKind, JobStatus};
 use crate::ring_buffer::RingBuffer;
 use crate::scan::{self, DiscoveredProject};
 use crate::ui::theme::Theme;
+use crate::version_bump::{
+    apply_bump_plan, bump_semver, commit_applied_bumps, find_version_file, BumpDependentsPlan,
+    BumpKind, BumpRow,
+};
 
 mod root_editor;
 pub mod settings;
@@ -70,6 +74,14 @@ pub fn is_ephemeral_status_text(s: &str) -> bool {
         || s.starts_with("updated root")
         || s.starts_with("deleted root")
         || s.starts_with("cascade")
+        || s.starts_with("plan ")
+        || s.starts_with("plan:")
+        || s.starts_with("publish &")
+        || s.starts_with("lib update")
+        || s.starts_with("rebuild")
+        || s.starts_with("catch-up")
+        || s.starts_with("catch up")
+        || s.starts_with("bump")
         || s.starts_with("skaffold")
         || s.starts_with("clean")
         || s.starts_with("git")
@@ -77,6 +89,12 @@ pub fn is_ephemeral_status_text(s: &str) -> bool {
         || s.starts_with("job ")
         || s.starts_with("kube ")
         || s.starts_with("filter:")
+        || s.starts_with("no project")
+        || s.starts_with("nothing depends")
+        || s.starts_with("multi ")
+        || s.starts_with("multi+")
+        || s.starts_with("multi-")
+        || s.starts_with("multi cleared")
         || s.contains("fail")
         || s.contains("error")
 }
@@ -110,6 +128,32 @@ pub enum Screen {
     Workspace,
     /// Config.toml settings editor (all scalar / list fields).
     Settings,
+}
+
+/// Pages inside the `?` help overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpPage {
+    /// ASCII flowcharts for lib vs service day-to-day flows.
+    #[default]
+    Workflows,
+    /// Per-screen keybind tables.
+    Keys,
+}
+
+impl HelpPage {
+    pub fn other(self) -> Self {
+        match self {
+            HelpPage::Workflows => HelpPage::Keys,
+            HelpPage::Keys => HelpPage::Workflows,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HelpPage::Workflows => "Workflows",
+            HelpPage::Keys => "Keys",
+        }
+    }
 }
 
 /// Project kind heuristic (scan fills this; UI may override later).
@@ -207,6 +251,12 @@ pub struct ProjectRow {
     /// Soft owner hint from cluster labels (`argocd`, `helm`, …).
     #[serde(default, skip_serializing)]
     pub deploy_owner: Option<String>,
+    /// Git sync vs upstream for projects table (**r** probe): `ok`, `↓3`, `dirty`, `—`.
+    #[serde(default, skip_serializing)]
+    pub git_sync: String,
+    /// Nexus vs local for publishers (**r** probe): `ok`, `newer`, `miss`, `—`, `?`.
+    #[serde(default, skip_serializing)]
+    pub nexus: String,
 }
 
 impl ProjectRow {
@@ -234,6 +284,8 @@ impl ProjectRow {
             deployed_version: None,
             drift: Drift::NotApplicable,
             deploy_owner: None,
+            git_sync: "—".into(),
+            nexus: "—".into(),
         }
     }
 
@@ -258,17 +310,57 @@ impl ProjectRow {
     }
 }
 
-/// Stable display order: folder_group then name; returns indices into `projects`.
-pub fn project_display_order(projects: &[ProjectRow]) -> Vec<usize> {
+/// Stable display order: favorites first, then folder_group then name.
+/// Returns indices into `projects`.
+pub fn project_display_order(projects: &[ProjectRow], favorites: &[String]) -> Vec<usize> {
     let mut idxs: Vec<usize> = (0..projects.len()).collect();
     idxs.sort_by(|&a, &b| {
-        let ga = projects[a].folder_group.as_deref().unwrap_or("");
-        let gb = projects[b].folder_group.as_deref().unwrap_or("");
-        ga.cmp(gb)
+        let fa = is_favorite(&projects[a], favorites);
+        let fb = is_favorite(&projects[b], favorites);
+        fb.cmp(&fa) // favorites first
+            .then_with(|| {
+                let ga = projects[a].folder_group.as_deref().unwrap_or("");
+                let gb = projects[b].folder_group.as_deref().unwrap_or("");
+                ga.cmp(gb)
+            })
             .then_with(|| projects[a].name.cmp(&projects[b].name))
             .then_with(|| projects[a].path.cmp(&projects[b].path))
     });
     idxs
+}
+
+pub fn is_favorite(project: &ProjectRow, favorites: &[String]) -> bool {
+    favorites.iter().any(|f| f == &project.name || project.name.ends_with(&format!("/{f}")))
+}
+
+/// Display order with optional drift-only + name filter (storage indices).
+pub fn project_display_order_filtered(
+    projects: &[ProjectRow],
+    favorites: &[String],
+    filter_drift_only: bool,
+    project_filter: Option<&str>,
+) -> Vec<usize> {
+    let mut order = project_display_order(projects, favorites);
+    if filter_drift_only {
+        order.retain(|&i| {
+            matches!(
+                projects.get(i).map(|p| p.drift),
+                Some(Drift::LocalAhead | Drift::ClusterAhead | Drift::Unknown)
+            )
+        });
+    }
+    if let Some(q) = project_filter {
+        let q = q.to_ascii_lowercase();
+        if !q.is_empty() {
+            order.retain(|&i| {
+                projects.get(i).is_some_and(|p| {
+                    p.name.to_ascii_lowercase().contains(&q)
+                        || p.display_name().to_ascii_lowercase().contains(&q)
+                })
+            });
+        }
+    }
+    order
 }
 
 pub struct App {
@@ -313,6 +405,8 @@ pub struct App {
     pub theme: Theme,
     /// Global help overlay (`?`).
     pub help_visible: bool,
+    /// Which page of help is showing (keys vs workflow flowchart).
+    pub help_page: HelpPage,
     /// Recent per-paint durations in milliseconds (oldest first).
     pub frame_ms_samples: RingBuffer<f64>,
     /// Full-screen splash — shown once at startup until dismissed.
@@ -347,12 +441,22 @@ pub struct App {
     pub job_log_scroll: usize,
     /// Open cascade plan (confirm overlay when `!executing`; sequencing when executing).
     pub plan: Option<CascadePlan>,
+    /// Bump dependents version plan (confirm overlay).
+    pub bump_plan: Option<BumpDependentsPlan>,
     /// Phase 2: kube probe in flight.
     pub kube_probing: bool,
     /// When the last successful kube probe finished.
     pub kube_probed_at: Option<Instant>,
     /// Phase 2: project browser shows only rows with drift / unknown deployed.
     pub filter_drift_only: bool,
+    /// Name filter query (`/`); empty string still means filter mode active.
+    pub project_filter: Option<String>,
+    /// Impact checklist overlay (`i`) for selected project's dependents.
+    pub impact_visible: bool,
+    /// Pending skaffold action blocked by Argo guard: (subcommand, extra_args).
+    pub pending_argo_skaffold: Option<(String, Vec<String>)>,
+    /// After these skaffold job ids finish ok, re-probe kube for the project path.
+    pub probe_after_skaffold_jobs: std::collections::HashSet<u64>,
     /// Monotonic job id allocator.
     next_job_id: u64,
     /// Clickable regions registered by the most recent `ui::draw` call.
@@ -400,6 +504,7 @@ impl App {
             banner_mode,
             theme,
             help_visible: false,
+            help_page: HelpPage::Workflows,
             frame_ms_samples: RingBuffer::new(FRAME_MS_SAMPLE_CAPACITY),
             show_splash: true,
             scanning: false,
@@ -417,9 +522,14 @@ impl App {
             jobs_focus: JobsFocus::List,
             job_log_scroll: 0,
             plan: None,
+            bump_plan: None,
             kube_probing: false,
             kube_probed_at: None,
             filter_drift_only: false,
+            project_filter: None,
+            impact_visible: false,
+            pending_argo_skaffold: None,
+            probe_after_skaffold_jobs: std::collections::HashSet::new(),
             next_job_id: 1,
             click_regions: RefCell::new(Vec::new()),
             mouse_pos: Cell::new(None),
@@ -429,6 +539,199 @@ impl App {
     /// True when a cascade plan confirm overlay owns keyboard focus.
     pub fn plan_confirming(&self) -> bool {
         self.plan.as_ref().is_some_and(|p| p.is_confirming())
+    }
+
+    /// Bump-dependents overlay owns the keyboard when present.
+    pub fn bump_confirming(&self) -> bool {
+        self.bump_plan.is_some()
+    }
+
+    /// Open a plan to bump **this** project's Gradle version (prep before deploy).
+    fn open_bump_version(&mut self) {
+        if self.projects.is_empty() || self.selected_index >= self.projects.len() {
+            self.set_ephemeral_status("no project selected");
+            return;
+        }
+        let idx = self.selected_index;
+        let row = &self.projects[idx];
+        self.open_bump_plan_for_rows(
+            row.name.clone(),
+            row.version.clone(),
+            vec![self.bump_row_for_index(idx, BumpKind::Patch)],
+            format!("bump version of {} — Tab kind · y apply · n cancel", row.name),
+        );
+    }
+
+    /// **V**: bump versions of projects that depend on the selection (manual).
+    fn open_bump_dependents(&mut self) {
+        if self.projects.is_empty() || self.selected_index >= self.projects.len() {
+            self.set_ephemeral_status("no project selected");
+            return;
+        }
+        let source = &self.projects[self.selected_index];
+        let source_id = self
+            .graph
+            .id_at(self.selected_index)
+            .unwrap_or(source.name.as_str())
+            .to_string();
+        let dependents = self.graph.dependents_transitive_topo(&source_id);
+        if dependents.is_empty() {
+            self.set_ephemeral_status(format!(
+                "nothing depends on {} — nothing to version-bump",
+                source.name
+            ));
+            return;
+        }
+        let kind = BumpKind::Patch;
+        let mut rows = Vec::new();
+        for dep_id in &dependents {
+            let Some(idx) = self.graph.index_of(dep_id) else {
+                continue;
+            };
+            rows.push(self.bump_row_for_index(idx, kind));
+        }
+        if rows.is_empty() {
+            self.set_ephemeral_status("no related projects found to version-bump");
+            return;
+        }
+        let source_name = source.name.clone();
+        let source_version = source.version.clone();
+        self.open_bump_plan_for_rows(
+            source_name.clone(),
+            source_version,
+            rows,
+            format!(
+                "bump dependent versions of {source_name} — Tab kind · y apply · n cancel"
+            ),
+        );
+    }
+
+    fn bump_row_for_index(&self, idx: usize, kind: BumpKind) -> BumpRow {
+        let row = &self.projects[idx];
+        let old = row.version.clone();
+        let (new_version, mut error) = match bump_semver(&old, kind) {
+            Ok(v) => (v, None),
+            Err(e) => (old.clone(), Some(e)),
+        };
+        let file = match find_version_file(&row.path) {
+            Some(f) => f,
+            None => {
+                if error.is_none() {
+                    error = Some(
+                        "no version file (build.gradle.kts / gradle.properties)".into(),
+                    );
+                }
+                row.path.clone()
+            }
+        };
+        BumpRow {
+            project_index: idx,
+            project_name: row.name.clone(),
+            project_path: row.path.clone(),
+            old_version: old,
+            new_version,
+            file,
+            error,
+        }
+    }
+
+    fn open_bump_plan_for_rows(
+        &mut self,
+        source_name: String,
+        source_version: String,
+        mut rows: Vec<BumpRow>,
+        status: String,
+    ) {
+        rows.sort_by(|a, b| a.project_name.cmp(&b.project_name));
+        self.help_visible = false;
+        self.bump_plan = Some(BumpDependentsPlan {
+            source_name,
+            source_version,
+            kind: BumpKind::Patch,
+            rows,
+            cursor: 0,
+        });
+        self.status_message = Some(status);
+        self.status_clear_at = None;
+    }
+
+    fn cycle_bump_kind(&mut self) {
+        let Some(plan) = self.bump_plan.as_mut() else {
+            return;
+        };
+        plan.set_kind(plan.kind.next());
+        self.status_message = Some(format!(
+            "bump kind: {} · y apply · n cancel",
+            plan.kind.label()
+        ));
+        self.status_clear_at = None;
+    }
+
+    fn set_bump_kind(&mut self, kind: BumpKind) {
+        let Some(plan) = self.bump_plan.as_mut() else {
+            return;
+        };
+        plan.set_kind(kind);
+        self.status_message = Some(format!(
+            "bump kind: {} · y apply · n cancel",
+            plan.kind.label()
+        ));
+        self.status_clear_at = None;
+    }
+
+    fn cancel_bump_dependents(&mut self) {
+        if self.bump_plan.take().is_some() {
+            self.set_ephemeral_status("bump cancelled");
+        }
+    }
+
+    fn confirm_bump_dependents(&mut self) -> Vec<Command> {
+        let Some(plan) = self.bump_plan.take() else {
+            return vec![];
+        };
+        let kind = plan.kind.label().to_string();
+        let source = plan.source_name.clone();
+        let (applied, mut errs) = apply_bump_plan(&plan);
+        let ok = applied.len();
+
+        // Reflect new versions in inventory for successful rewrites.
+        for a in &applied {
+            if let Some(p) = self
+                .projects
+                .iter_mut()
+                .find(|p| p.path == a.project_path)
+            {
+                p.version = a.new_version.clone();
+            }
+        }
+
+        if ok == 0 {
+            let detail = errs.first().cloned().unwrap_or_else(|| "no changes".into());
+            self.set_ephemeral_status(format!("bump failed: {detail}"));
+            return vec![];
+        }
+
+        // One git commit per git root: "Bump versions due to {source} dependency"
+        let (commits, commit_errs) = commit_applied_bumps(&source, &applied);
+        errs.extend(commit_errs);
+
+        let mut msg = format!("bumped version of {source} ({kind})");
+        if ok > 1 {
+            msg = format!("bumped {ok} project version(s) ({kind})");
+        }
+        if commits > 0 {
+            msg.push_str(&format!(" · {commits} git commit(s)"));
+        }
+        if !errs.is_empty() {
+            msg.push_str(&format!(" · {} warning(s)", errs.len()));
+        }
+        self.set_ephemeral_status(msg);
+        // Soft rescan so produces/edges pick up new versions.
+        if !self.config.scan.roots.is_empty() {
+            vec![Command::ScanWorkspace]
+        } else {
+            vec![]
+        }
     }
 
     /// Recompute dep/dependent highlight sets for the current selection.
@@ -570,8 +873,17 @@ impl App {
                 if len == 0 {
                     return;
                 }
-                // Move through display order so j/k matches the on-screen list.
-                let order = project_display_order(&self.projects);
+                // Move through display order so j/k matches the on-screen list
+                // (favorites + drift-only + name filter).
+                let order = project_display_order_filtered(
+                    &self.projects,
+                    &self.config.ui.favorites,
+                    self.filter_drift_only,
+                    self.project_filter.as_deref(),
+                );
+                if order.is_empty() {
+                    return;
+                }
                 let cur_pos = order
                     .iter()
                     .position(|&i| i == self.selected_index)
@@ -638,44 +950,6 @@ impl App {
         self.project_detail_scroll = 0;
     }
 
-    /// Open `publish_and_rebuild_consumers` plan (**B**): publish cursor project,
-    /// then sequential gradle build of graph **dependents** (no skaffold).
-    /// Consumer builds use the SNAPSHOT-refresh init script when configured.
-    fn start_build_with_deps(&mut self) -> Vec<Command> {
-        if self.plan.as_ref().is_some_and(|p| p.executing) {
-            self.set_ephemeral_status("cascade already running");
-            return vec![];
-        }
-        if self.projects.is_empty() {
-            self.set_ephemeral_status("no project selected");
-            return vec![];
-        }
-        self.project_detail_visible = false;
-        self.help_visible = false;
-
-        match build_publish_and_rebuild(
-            &self.projects,
-            &self.graph,
-            self.selected_index,
-            &self.config,
-        ) {
-            Ok(plan) => {
-                let n = plan.steps.len();
-                let name = plan.source_name.clone();
-                self.plan = Some(plan);
-                self.status_message = Some(format!(
-                    "rebuild plan: {name} ({n} steps) — y run / n cancel"
-                ));
-                self.status_clear_at = None;
-            }
-            Err(err) => {
-                self.plan = None;
-                self.set_ephemeral_status(format!("rebuild: {err}"));
-            }
-        }
-        vec![]
-    }
-
     fn clamp_selection(&mut self) {
         if self.projects.is_empty() {
             self.selected_index = 0;
@@ -723,9 +997,31 @@ impl App {
         if self.projects.is_empty() || self.selected_index >= self.projects.len() {
             return;
         }
+        // Leave detail so the `*` marks on the list are visible.
+        self.project_detail_visible = false;
+        // Leave filter typing mode (keep query) so Space isn't eaten as filter text.
+        // (Filter mode is cleared only if empty; non-empty query stays applied.)
+        if self.project_filter.as_ref().is_some_and(|q| q.is_empty()) {
+            self.project_filter = None;
+        }
+
         let idx = self.selected_index;
+        let name = self.projects[idx].name.clone();
         if !self.multi_selected.remove(&idx) {
             self.multi_selected.insert(idx);
+            let n = self.multi_selected.len();
+            self.set_ephemeral_status(format!(
+                "multi +{name} ({n}) · Space toggle · b/B/c/G bulk · Esc clear"
+            ));
+        } else {
+            let n = self.multi_selected.len();
+            if n == 0 {
+                self.set_ephemeral_status(format!("multi cleared ({name})"));
+            } else {
+                self.set_ephemeral_status(format!(
+                    "multi -{name} ({n} left) · b/B/c/G bulk · Esc clear"
+                ));
+            }
         }
     }
 
@@ -774,6 +1070,15 @@ impl App {
     }
 
     fn start_gradle_on(&mut self, targets: Vec<usize>, tasks: Vec<String>) -> Vec<Command> {
+        self.start_gradle_on_opts(targets, tasks, false)
+    }
+
+    fn start_gradle_on_opts(
+        &mut self,
+        targets: Vec<usize>,
+        tasks: Vec<String>,
+        force_latest_snapshots: bool,
+    ) -> Vec<Command> {
         if tasks.is_empty() {
             self.set_ephemeral_status("no gradle tasks configured");
             return vec![];
@@ -803,7 +1108,7 @@ impl App {
                 path,
                 tasks: tasks.clone(),
                 project_name: project.name,
-                force_latest_snapshots: false,
+                force_latest_snapshots,
             });
         }
         if cmds.is_empty() {
@@ -811,10 +1116,15 @@ impl App {
             return vec![];
         }
         self.screen = Screen::Jobs;
-        let status = if names.len() == 1 {
-            format!("{label}… {}", names[0])
+        let snap = if force_latest_snapshots {
+            " · latest SNAPSHOT"
         } else {
-            format!("{label}… {} projects", names.len())
+            ""
+        };
+        let status = if names.len() == 1 {
+            format!("{label}… {}{snap}", names[0])
+        } else {
+            format!("{label}… {} projects{snap}", names.len())
         };
         self.status_message = Some(status);
         self.status_clear_at = None;
@@ -831,18 +1141,41 @@ impl App {
             self.set_ephemeral_status(format!("no skaffold file: {}", project.name));
             return vec![];
         };
-        // Soft warn when cluster probe saw Argo ownership (still allows run).
-        let argo_warn = project.deploy_owner.as_deref() == Some("argocd");
-        if argo_warn {
-            tracing::warn!(
-                project = %project.name,
-                "skaffold on Argo-managed workload may fail or be reverted"
-            );
+
+        // Manual deploy mode: refuse.
+        let mode = crate::deploy::effective_deploy_mode(&project, &self.config);
+        if mode == crate::config::DeployMode::Manual {
+            self.set_ephemeral_status(format!(
+                "deploy mode manual for {} — skaffold disabled",
+                project.name
+            ));
+            return vec![];
         }
+
+        // Argo guard: require explicit confirm.
+        if crate::deploy::skaffold_needs_argo_confirm(&project, &self.config) {
+            self.pending_argo_skaffold = Some((subcommand.to_string(), extra_args));
+            self.status_message = Some(format!(
+                "⚠ {} is managed by Argo CD — y force skaffold anyway / n cancel",
+                project.name
+            ));
+            self.status_clear_at = None;
+            return vec![];
+        }
+
+        self.start_skaffold_now(&project, skaffold_file, subcommand, extra_args)
+    }
+
+    fn start_skaffold_now(
+        &mut self,
+        project: &ProjectRow,
+        skaffold_file: PathBuf,
+        subcommand: &str,
+        extra_args: Vec<String>,
+    ) -> Vec<Command> {
         let id = self.alloc_job_id();
         let mut args = vec![subcommand.to_string()];
         args.extend(extra_args);
-        // Profile from config when set.
         let profile = self.config.skaffold.default_profile.clone();
         if !profile.is_empty() {
             args.push(format!("-p={profile}"));
@@ -852,23 +1185,149 @@ impl App {
         };
         let job = Job::new(id, project.name.clone(), project.path.clone(), kind);
         self.register_job(job);
+        // Post-deploy kube re-probe after run (not delete).
+        if subcommand == "run" && crate::kube::kube_probe_enabled(&self.config.kube) {
+            self.probe_after_skaffold_jobs.insert(id);
+        }
         self.screen = Screen::Jobs;
-        self.status_message = Some(if argo_warn {
-            format!(
-                "skaffold {subcommand}… {} · ⚠ Argo-managed (may fail/revert)",
-                project.name
-            )
+        let hint = if crate::deploy::needs_version_label_hint(project) {
+            " · tip: label app.kubernetes.io/version for drift"
         } else {
-            format!("skaffold {subcommand}… {}", project.name)
-        });
+            ""
+        };
+        self.status_message = Some(format!(
+            "skaffold {subcommand}… {}{hint}",
+            project.name
+        ));
         self.status_clear_at = None;
         vec![Command::RunSkaffold {
             id,
             path: project.path.clone(),
             args,
             skaffold_file,
-            project_name: project.name,
+            project_name: project.name.clone(),
         }]
+    }
+
+    fn open_plan_from(
+        &mut self,
+        build: impl FnOnce(
+            &[ProjectRow],
+            &DependencyGraph,
+            usize,
+            &Config,
+        ) -> Result<CascadePlan, String>,
+    ) -> Vec<Command> {
+        if self.plan.as_ref().is_some_and(|p| p.executing) {
+            self.set_ephemeral_status("a plan is already running");
+            return vec![];
+        }
+        if self.projects.is_empty() {
+            self.set_ephemeral_status("no project selected");
+            return vec![];
+        }
+        // Cache hydrate can leave graph empty while rows exist — refuse clearly.
+        if self.graph.is_empty() && !self.projects.is_empty() {
+            self.set_ephemeral_status("graph not ready — press w to rescan, then U again");
+            return vec![];
+        }
+        self.help_visible = false;
+        self.impact_visible = false;
+
+        match build(
+            &self.projects,
+            &self.graph,
+            self.selected_index,
+            &self.config,
+        ) {
+            Ok(plan) => {
+                let n = plan.steps.len();
+                let title = crate::exec::recipe_title(&plan.recipe);
+                let name = plan.source_name.clone();
+                // Only leave detail when the plan actually opens.
+                self.project_detail_visible = false;
+                self.plan = Some(plan);
+                self.status_message =
+                    Some(format!("{title}: {name} ({n} steps) — y run / n cancel"));
+                self.status_clear_at = None;
+            }
+            Err(err) => {
+                self.plan = None;
+                self.set_ephemeral_status(err);
+            }
+        }
+        vec![]
+    }
+
+    /// **U**: update full dependent tree (build + skaffold delete→run unless Argo).
+    fn open_update_dependents(&mut self) -> Vec<Command> {
+        self.open_plan_from(build_update_dependents)
+    }
+
+    /// **u**: skaffold delete → run for this project (confirm if Argo).
+    fn open_skaffold_redeploy(&mut self) -> Vec<Command> {
+        if self.plan.as_ref().is_some_and(|p| p.executing) {
+            self.set_ephemeral_status("a plan is already running");
+            return vec![];
+        }
+        let Some(project) = self.selected_project().cloned() else {
+            self.set_ephemeral_status("no project selected");
+            return vec![];
+        };
+        // Argo guard: confirm before force-redeploy.
+        if crate::deploy::skaffold_needs_argo_confirm(&project, &self.config) {
+            // Stash intent as a pending plan open after confirm — use existing
+            // argo confirm with a pseudo subcommand marker.
+            self.pending_argo_skaffold = Some(("redeploy".into(), vec![]));
+            self.status_message = Some(format!(
+                "⚠ {} is managed by Argo CD — y force skaffold delete→run / n cancel",
+                project.name
+            ));
+            self.status_clear_at = None;
+            return vec![];
+        }
+        match build_skaffold_redeploy(&self.projects, self.selected_index, &self.config) {
+            Ok(plan) => {
+                let n = plan.steps.len();
+                let name = plan.source_name.clone();
+                self.plan = Some(plan);
+                // Auto-start: no confirm overlay for single-service redeploy.
+                self.status_message =
+                    Some(format!("Skaffold redeploy: {name} ({n} steps)…"));
+                self.status_clear_at = None;
+                self.confirm_cascade_plan()
+            }
+            Err(err) => {
+                self.set_ephemeral_status(err);
+                vec![]
+            }
+        }
+    }
+
+    /// **r**: refresh stats — git remote lag (fetch), Nexus maven-metadata, optional kube.
+    fn refresh_stats(&mut self) -> Vec<Command> {
+        self.status_message = Some("refreshing git + nexus…".into());
+        self.status_clear_at = None;
+        let mut cmds = vec![Command::ProbeRepoStats { fetch_git: true }];
+        if crate::kube::kube_probe_enabled(&self.config.kube) && !self.kube_probing {
+            self.kube_probing = true;
+            cmds.push(Command::ProbeKubeVersions);
+        }
+        cmds
+    }
+
+    fn toggle_favorite(&mut self) {
+        let Some(name) = self.selected_project().map(|p| p.name.clone()) else {
+            return;
+        };
+        if let Some(pos) = self.config.ui.favorites.iter().position(|f| f == &name) {
+            self.config.ui.favorites.remove(pos);
+            self.set_ephemeral_status(format!("unfavorited {name}"));
+        } else {
+            self.config.ui.favorites.push(name.clone());
+            self.set_ephemeral_status(format!("favorited {name}"));
+        }
+        let _ = crate::config::save(&self.config_path, &self.config);
     }
 
     /// Git pull for action targets: one job per unique `git_root` among targets.
@@ -966,48 +1425,13 @@ impl App {
         vec![Command::CancelJob { id }]
     }
 
-    /// Open `publish_and_redeploy_consumers` plan for the cursor project (`P`).
-    fn open_cascade_publish(&mut self) -> Vec<Command> {
-        if self.plan.as_ref().is_some_and(|p| p.executing) {
-            self.set_ephemeral_status("cascade already running");
-            return vec![];
-        }
-        if self.projects.is_empty() {
-            self.set_ephemeral_status("no project selected");
-            return vec![];
-        }
-        self.project_detail_visible = false;
-        self.help_visible = false;
-
-        match build_publish_and_redeploy(
-            &self.projects,
-            &self.graph,
-            self.selected_index,
-            &self.config,
-        ) {
-            Ok(plan) => {
-                let n = plan.steps.len();
-                let name = plan.source_name.clone();
-                self.plan = Some(plan);
-                self.status_message =
-                    Some(format!("cascade plan: {name} ({n} steps) — y run / n cancel"));
-                self.status_clear_at = None;
-            }
-            Err(err) => {
-                self.plan = None;
-                self.set_ephemeral_status(format!("cascade: {err}"));
-            }
-        }
-        vec![]
-    }
-
     fn cancel_cascade_plan(&mut self) {
         if self.plan.as_ref().is_some_and(|p| p.executing) {
             return;
         }
         if self.plan.is_some() {
             self.plan = None;
-            self.set_ephemeral_status("cascade cancelled");
+            self.set_ephemeral_status("plan cancelled");
         }
     }
 
@@ -1021,16 +1445,17 @@ impl App {
         }
         if plan.steps.is_empty() {
             self.plan = None;
-            self.set_ephemeral_status("cascade: empty plan");
+            self.set_ephemeral_status("plan is empty — nothing to run");
             return vec![];
         }
         plan.executing = true;
         plan.cursor = 0;
         plan.active_jobs.clear();
+        let title = crate::exec::recipe_title(&plan.recipe);
         let name = plan.source_name.clone();
         let n = plan.steps.len();
         self.screen = Screen::Jobs;
-        self.status_message = Some(format!("cascade… {name} (0/{n})"));
+        self.status_message = Some(format!("{title}… {name} (0/{n})"));
         self.status_clear_at = None;
         self.dispatch_cascade_ready()
     }
@@ -1073,14 +1498,19 @@ impl App {
         }
 
         if self.plan.as_ref().is_some_and(|p| p.is_fully_done()) {
-            let name = self
+            let (title, name, n) = self
                 .plan
                 .as_ref()
-                .map(|p| p.source_name.clone())
-                .unwrap_or_default();
-            let n = self.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
+                .map(|p| {
+                    (
+                        crate::exec::recipe_title(&p.recipe).to_string(),
+                        p.source_name.clone(),
+                        p.steps.len(),
+                    )
+                })
+                .unwrap_or_else(|| ("Plan".into(), String::new(), 0));
             self.plan = None;
-            self.set_ephemeral_status(format!("cascade complete: {name} ({n} steps ok)"));
+            self.set_ephemeral_status(format!("{title} complete: {name} ({n} steps ok)"));
         } else {
             self.refresh_cascade_status();
         }
@@ -1091,6 +1521,7 @@ impl App {
         let Some(plan) = self.plan.as_ref() else {
             return;
         };
+        let title = crate::exec::recipe_title(&plan.recipe);
         let n = plan.steps.len();
         let done = plan.completed_count();
         let running = plan.running_count();
@@ -1108,7 +1539,7 @@ impl App {
             format!(" · {} jobs", running_names.len())
         };
         self.status_message = Some(format!(
-            "cascade… {name} ({done}/{n} done, {running} running{detail})"
+            "{title}… {name} ({done}/{n} done, {running} running{detail})"
         ));
         self.status_clear_at = None;
     }
@@ -1121,6 +1552,40 @@ impl App {
         }
 
         match step.kind {
+            CascadeStepKind::GitPull => {
+                let Some(git_root) = self
+                    .projects
+                    .iter()
+                    .find(|p| p.path == step.project_path)
+                    .and_then(|p| p.git_root.clone())
+                else {
+                    if let Some(p) = self.plan.as_mut() {
+                        if let Some(s) = p.steps.get_mut(idx) {
+                            s.status = CascadeStepStatus::Skipped;
+                            s.job_id = None;
+                        }
+                    }
+                    return None;
+                };
+                let id = self.alloc_job_id();
+                if let Some(p) = self.plan.as_mut() {
+                    p.register_active(id, idx);
+                }
+                let job = Job::new(
+                    id,
+                    step.project_name.clone(),
+                    step.project_path.clone(),
+                    JobKind::GitPull,
+                );
+                self.register_job(job);
+                Some(Command::GitPull {
+                    id,
+                    git_root,
+                    project_name: step.project_name,
+                    project_path: step.project_path,
+                    ff_only: self.config.git.pull_ff_only,
+                })
+            }
             CascadeStepKind::Gradle {
                 tasks,
                 force_latest_snapshots,
@@ -1203,10 +1668,10 @@ impl App {
             // cascade once plan is cleared.
             self.plan = None;
             let toast = if cancelled {
-                format!("cascade cancelled at {job_name} (step {}/{n})", step_idx + 1)
+                format!("plan cancelled at {job_name} (step {}/{n})", step_idx + 1)
             } else {
                 format!(
-                    "cascade failed at {job_name} ({kind_label}, step {}/{n}) — {log_tail}",
+                    "plan failed at {job_name} ({kind_label}, step {}/{n}) — {log_tail}",
                     step_idx + 1
                 )
             };
@@ -1224,6 +1689,16 @@ impl App {
         match action {
             Action::ToggleHelp => {
                 self.help_visible = !self.help_visible;
+                if self.help_visible {
+                    // Land on flowcharts first — keys are the other Tab page.
+                    self.help_page = HelpPage::Workflows;
+                }
+                vec![]
+            }
+            Action::CycleHelpPage => {
+                if self.help_visible {
+                    self.help_page = self.help_page.other();
+                }
                 vec![]
             }
             Action::Quit => {
@@ -1245,6 +1720,12 @@ impl App {
                 vec![]
             }
             Action::MoveSelectionUp => {
+                if self.bump_confirming() {
+                    if let Some(p) = self.bump_plan.as_mut() {
+                        p.move_cursor(-1);
+                    }
+                    return vec![];
+                }
                 if self.plan_confirming() {
                     if let Some(p) = self.plan.as_mut() {
                         p.move_cursor(-1);
@@ -1268,6 +1749,12 @@ impl App {
                 vec![]
             }
             Action::MoveSelectionDown => {
+                if self.bump_confirming() {
+                    if let Some(p) = self.bump_plan.as_mut() {
+                        p.move_cursor(1);
+                    }
+                    return vec![];
+                }
                 if self.plan_confirming() {
                     if let Some(p) = self.plan.as_mut() {
                         p.move_cursor(1);
@@ -1299,6 +1786,9 @@ impl App {
                         self.workspace_panel = WorkspacePanel::Roots;
                         self.selected_root_index = index;
                     }
+                } else if self.screen == Screen::Jobs {
+                    self.jobs_focus = JobsFocus::List;
+                    self.set_selection(index);
                 } else {
                     self.set_selection(index);
                 }
@@ -1311,7 +1801,42 @@ impl App {
                 }
                 vec![]
             }
+            Action::FocusWorkspaceRoots => {
+                if self.screen == Screen::Workspace
+                    && self.root_editor.is_none()
+                    && self.root_delete_confirm.is_none()
+                    && self.exclude_delete_confirm.is_none()
+                {
+                    self.workspace_panel = WorkspacePanel::Roots;
+                }
+                vec![]
+            }
+            Action::FocusWorkspaceExcludes => {
+                if self.screen == Screen::Workspace
+                    && self.root_editor.is_none()
+                    && self.root_delete_confirm.is_none()
+                    && self.exclude_delete_confirm.is_none()
+                {
+                    self.workspace_panel = WorkspacePanel::Excludes;
+                }
+                vec![]
+            }
+            Action::FocusJobsList => {
+                if self.screen == Screen::Jobs {
+                    self.jobs_focus = JobsFocus::List;
+                }
+                vec![]
+            }
+            Action::FocusJobsLog => {
+                if self.screen == Screen::Jobs {
+                    self.jobs_focus = JobsFocus::Log;
+                }
+                vec![]
+            }
             Action::Confirm => {
+                if self.bump_confirming() {
+                    return self.confirm_bump_dependents();
+                }
                 if self.plan_confirming() {
                     return self.confirm_cascade_plan();
                 }
@@ -1341,6 +1866,23 @@ impl App {
                 vec![]
             }
             Action::Back => {
+                if self.pending_argo_skaffold.is_some() {
+                    self.pending_argo_skaffold = None;
+                    self.set_ephemeral_status("skaffold cancelled (Argo CD guard)");
+                    return vec![];
+                }
+                if self.project_filter.is_some() {
+                    self.project_filter = None;
+                    return vec![];
+                }
+                if self.impact_visible {
+                    self.impact_visible = false;
+                    return vec![];
+                }
+                if self.bump_confirming() {
+                    self.cancel_bump_dependents();
+                    return vec![];
+                }
                 if self.plan_confirming() {
                     self.cancel_cascade_plan();
                     return vec![];
@@ -1638,31 +2180,30 @@ impl App {
             }
             Action::SaveRoot => self.save_root(),
 
-            // ── M3/M5 project exec (single or multi-select bulk for b/c/G) ──
+            // Project exec
             Action::Build => {
                 let tasks = self.config.gradle.default_tasks_build.clone();
                 self.start_gradle(tasks)
             }
-            Action::BuildWithDeps => self.start_build_with_deps(),
+            Action::BuildForce => {
+                let tasks = self.config.gradle.default_tasks_build.clone();
+                self.start_gradle_on_opts(self.action_target_indices(), tasks, true)
+            }
             Action::Clean => {
                 let tasks = self.config.gradle.default_tasks_clean.clone();
                 self.start_gradle(tasks)
             }
             Action::Publish => {
-                // Publish stays single-project (cursor); cascade is a separate action.
                 let tasks = self.config.gradle.default_tasks_publish.clone();
                 self.start_gradle_single(tasks)
             }
-            Action::SkaffoldDev => {
-                let extra = self.config.skaffold.dev_args.clone();
-                self.start_skaffold("dev", extra)
-            }
-            Action::SkaffoldDebug => {
-                let extra = self.config.skaffold.debug_args.clone();
-                self.start_skaffold("debug", extra)
+            Action::SkaffoldRedeploy => {
+                if self.screen == Screen::ProjectBrowser {
+                    return self.open_skaffold_redeploy();
+                }
+                vec![]
             }
             Action::SkaffoldDelete => self.start_skaffold("delete", vec![]),
-            Action::SkaffoldRun => self.start_skaffold("run", vec![]),
             Action::GitPull => self.start_git_pull(),
             Action::ToggleMultiSelect => {
                 if self.screen == Screen::ProjectBrowser {
@@ -1680,11 +2221,122 @@ impl App {
                 }
                 vec![]
             }
-            // M4 cascade — open/confirm/cancel plan.
-            Action::CascadePublish => self.open_cascade_publish(),
+            Action::UpdateDependents => {
+                if self.screen == Screen::ProjectBrowser {
+                    return self.open_update_dependents();
+                }
+                vec![]
+            }
             Action::ConfirmCascadePlan => self.confirm_cascade_plan(),
             Action::CancelCascadePlan => {
                 self.cancel_cascade_plan();
+                vec![]
+            }
+            Action::OpenBumpVersion => {
+                if self.screen == Screen::ProjectBrowser {
+                    self.open_bump_version();
+                }
+                vec![]
+            }
+            Action::OpenBumpDependents => {
+                if self.screen == Screen::ProjectBrowser {
+                    self.open_bump_dependents();
+                }
+                vec![]
+            }
+            Action::RefreshStats => {
+                if self.screen == Screen::ProjectBrowser {
+                    return self.refresh_stats();
+                }
+                vec![]
+            }
+            Action::ToggleImpact => {
+                if self.screen == Screen::ProjectBrowser {
+                    self.impact_visible = !self.impact_visible;
+                    if self.impact_visible {
+                        self.project_detail_visible = true;
+                    }
+                }
+                vec![]
+            }
+            Action::ToggleFavorite => {
+                if self.screen == Screen::ProjectBrowser {
+                    self.toggle_favorite();
+                }
+                vec![]
+            }
+            Action::StartProjectFilter => {
+                if self.screen == Screen::ProjectBrowser {
+                    self.project_filter = Some(String::new());
+                }
+                vec![]
+            }
+            Action::ProjectFilterChar(c) => {
+                if let Some(q) = self.project_filter.as_mut() {
+                    q.push(c);
+                }
+                vec![]
+            }
+            Action::ProjectFilterBackspace => {
+                if let Some(q) = self.project_filter.as_mut() {
+                    q.pop();
+                }
+                vec![]
+            }
+            Action::ClearProjectFilter => {
+                self.project_filter = None;
+                vec![]
+            }
+            Action::ConfirmArgoSkaffold => {
+                let Some((sub, extra)) = self.pending_argo_skaffold.take() else {
+                    return vec![];
+                };
+                if sub == "redeploy" {
+                    // Force open delete→run plan and run it.
+                    match build_skaffold_redeploy(
+                        &self.projects,
+                        self.selected_index,
+                        &self.config,
+                    ) {
+                        Ok(plan) => {
+                            let n = plan.steps.len();
+                            let name = plan.source_name.clone();
+                            self.plan = Some(plan);
+                            self.status_message =
+                                Some(format!("Skaffold redeploy: {name} ({n} steps)…"));
+                            self.status_clear_at = None;
+                            return self.confirm_cascade_plan();
+                        }
+                        Err(err) => {
+                            self.set_ephemeral_status(err);
+                            return vec![];
+                        }
+                    }
+                }
+                let Some(project) = self.selected_project().cloned() else {
+                    return vec![];
+                };
+                let Some(skaffold_file) = project.skaffold_path.clone() else {
+                    return vec![];
+                };
+                self.start_skaffold_now(&project, skaffold_file, &sub, extra)
+            }
+            Action::CancelArgoSkaffold => {
+                self.pending_argo_skaffold = None;
+                self.set_ephemeral_status("skaffold cancelled (Argo CD guard)");
+                vec![]
+            }
+            Action::CycleBumpKind => {
+                self.cycle_bump_kind();
+                vec![]
+            }
+            Action::SetBumpKind(kind) => {
+                self.set_bump_kind(kind);
+                vec![]
+            }
+            Action::ConfirmBumpDependents => self.confirm_bump_dependents(),
+            Action::CancelBumpDependents => {
+                self.cancel_bump_dependents();
                 vec![]
             }
             // Phase 2 kube.
@@ -1808,6 +2460,43 @@ impl App {
                 }
                 vec![]
             }
+            AppEvent::RepoStatsFinished { git, nexus, error } => {
+                for (root, info) in &git {
+                    for p in &mut self.projects {
+                        if p.git_root.as_ref() == Some(root) {
+                            p.branch = info.branch.clone();
+                            p.git_dirty = info.dirty;
+                            p.git_sync = info.sync_label();
+                        }
+                    }
+                }
+                crate::nexus::apply_nexus_batch(&mut self.projects, &nexus);
+                // Also stamp service rows without git root.
+                for p in &mut self.projects {
+                    if p.git_root.is_none() && p.git_sync.is_empty() {
+                        p.git_sync = "—".into();
+                    }
+                    if !crate::nexus::should_probe_nexus(p) {
+                        p.nexus = "—".into();
+                    }
+                }
+                if let Some(err) = error {
+                    self.set_ephemeral_status(format!("stats partial: {err}"));
+                } else if let Some(err) = &nexus.error {
+                    self.set_ephemeral_status(format!("stats: nexus {err}"));
+                } else {
+                    let behind = self
+                        .projects
+                        .iter()
+                        .filter(|p| p.git_sync.contains('↓'))
+                        .count();
+                    let newer = self.projects.iter().filter(|p| p.nexus == "newer").count();
+                    self.set_ephemeral_status(format!(
+                        "stats ok · git↓{behind} · nexus newer:{newer}"
+                    ));
+                }
+                vec![]
+            }
             AppEvent::KubeProbeFinished { batch } => {
                 self.kube_probing = false;
                 if let Some(err) = &batch.error {
@@ -1925,6 +2614,16 @@ impl App {
                         &log_tail,
                     ) {
                         return cmds;
+                    }
+
+                    // Post-skaffold kube re-probe for this project.
+                    let want_probe = self.probe_after_skaffold_jobs.remove(&id);
+                    if want_probe && ok && !cancelled && crate::kube::kube_probe_enabled(&self.config.kube)
+                    {
+                        let toast = format!("{kind_label} ok: {name} · re-probing kube…");
+                        self.set_ephemeral_status(toast);
+                        self.kube_probing = true;
+                        return vec![Command::ProbeKubeVersions];
                     }
 
                     let toast = if cancelled {
@@ -2108,6 +2807,7 @@ mod tests {
             ui: UiConfig {
                 theme: ThemeName::Light,
                 banner_mode: BannerMode::Off,
+                favorites: vec![],
             },
             ..Default::default()
         };
@@ -2354,7 +3054,7 @@ mod tests {
         a.folder_group = Some("b".into());
         let mut b = sample_project("alpha");
         b.folder_group = Some("a".into());
-        let order = project_display_order(&[a, b]);
+        let order = project_display_order(&[a, b], &[]);
         assert_eq!(order, vec![1, 0]);
     }
 
@@ -2539,6 +3239,40 @@ mod tests {
     }
 
     #[test]
+    fn mouse_focus_switches_workspace_and_jobs_panels() {
+        let mut app = App::new(Config::default(), test_config_path());
+        app.show_splash = false;
+        app.screen = Screen::Workspace;
+        app.workspace_panel = WorkspacePanel::Roots;
+
+        app.update(Action::FocusWorkspaceExcludes);
+        assert_eq!(app.workspace_panel, WorkspacePanel::Excludes);
+        app.update(Action::FocusWorkspaceRoots);
+        assert_eq!(app.workspace_panel, WorkspacePanel::Roots);
+
+        app.screen = Screen::Jobs;
+        app.jobs_focus = JobsFocus::List;
+        app.update(Action::FocusJobsLog);
+        assert_eq!(app.jobs_focus, JobsFocus::Log);
+        app.update(Action::FocusJobsList);
+        assert_eq!(app.jobs_focus, JobsFocus::List);
+
+        // Selecting a job row also focuses the list.
+        app.jobs_focus = JobsFocus::Log;
+        app.jobs.push(crate::jobs::Job::new(
+            1,
+            "demo",
+            std::path::PathBuf::from("/tmp/demo"),
+            crate::jobs::JobKind::Gradle {
+                tasks: vec!["build".into()],
+            },
+        ));
+        app.update(Action::SelectRow(0));
+        assert_eq!(app.jobs_focus, JobsFocus::List);
+        assert_eq!(app.selected_job, 0);
+    }
+
+    #[test]
     fn workspace_tab_and_exclude_crud() {
         let path = test_config_path();
         let mut app = App::new(Config::default(), path.clone());
@@ -2678,6 +3412,30 @@ mod tests {
     }
 
     #[test]
+    fn open_bump_version_for_cursor_project() {
+        let mut app = App::new(Config::default(), test_config_path());
+        app.show_splash = false;
+        let svc = discovered(
+            "payments-api",
+            ProjectKind::Service,
+            "3.1.0",
+            "main",
+            true,
+            false,
+        );
+        app.apply_scan_projects(&[svc]);
+        app.selected_index = 0;
+
+        app.update(Action::OpenBumpVersion);
+        let plan = app.bump_plan.as_ref().expect("plan");
+        assert_eq!(plan.kind, BumpKind::Patch);
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(plan.rows[0].old_version, "3.1.0");
+        assert_eq!(plan.rows[0].new_version, "3.1.1");
+        assert_eq!(plan.rows[0].project_name, "payments-api");
+    }
+
+    #[test]
     fn settings_toggle_kube_enabled_saves() {
         let path = test_config_path();
         let mut app = App::new(Config::default(), path.clone());
@@ -2723,8 +3481,8 @@ mod tests {
     }
 
     #[test]
-    fn build_with_deps_opens_rebuild_plan_not_parallel_builds() {
-        use crate::exec::RECIPE_PUBLISH_AND_REBUILD;
+    fn refresh_dependents_opens_plan_without_publish() {
+        use crate::exec::RECIPE_UPDATE_DEPENDENTS;
         use crate::gradle::model::{Coordinate, DepReq, Produces, VersionSpec};
 
         let mut app = App::new(Config::default(), test_config_path());
@@ -2756,42 +3514,42 @@ mod tests {
             "x",
         )];
         app.apply_scan_projects(&[lib, svc]);
-        // Cursor on library producer (not display-sorted index).
         app.selected_index = app
             .projects
             .iter()
             .position(|p| p.name == "common-lib")
             .expect("lib");
 
-        let cmds = app.update(Action::BuildWithDeps);
+        let cmds = app.update(Action::UpdateDependents);
         assert!(cmds.is_empty(), "plan open is confirm-only: {cmds:?}");
         assert!(app.plan_confirming());
         let plan = app.plan.as_ref().expect("plan");
-        assert_eq!(plan.recipe, RECIPE_PUBLISH_AND_REBUILD);
-        // publish + consumer build — no skaffold
+        assert_eq!(plan.recipe, RECIPE_UPDATE_DEPENDENTS);
+        // service only: pull + clean + build + delete + run
         assert_eq!(
             plan.steps.len(),
-            2,
+            5,
             "steps: {:?}",
             plan.steps.iter().map(|s| s.step_label()).collect::<Vec<_>>()
         );
+        assert!(matches!(plan.steps[0].kind, crate::exec::CascadeStepKind::GitPull));
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|s| s.contains("rebuild plan")),
+                .is_some_and(|s| s.contains("Update dependents")),
             "{:?}",
             app.status_message
         );
     }
 
     #[test]
-    fn skaffold_dev_requires_skaffold_file() {
+    fn skaffold_delete_requires_skaffold_file() {
         let mut app = App::new(Config::default(), test_config_path());
         let mut p = sample_project("lib");
         p.has_skaffold = false;
         p.skaffold_path = None;
         app.projects = vec![p];
-        let cmds = app.update(Action::SkaffoldDev);
+        let cmds = app.update(Action::SkaffoldDelete);
         assert!(cmds.is_empty());
         assert!(
             app.status_message
@@ -2803,23 +3561,27 @@ mod tests {
     }
 
     #[test]
-    fn skaffold_run_emits_command_with_file() {
+    fn skaffold_redeploy_starts_delete_then_run_plan() {
         let mut app = App::new(Config::default(), test_config_path());
+        app.show_splash = false;
         let mut p = sample_project("svc");
+        p.has_skaffold = true;
         p.skaffold_path = Some(PathBuf::from("/tmp/svc/skaffold.yaml"));
         app.projects = vec![p];
-        let cmds = app.update(Action::SkaffoldRun);
+        let cmds = app.update(Action::SkaffoldRedeploy);
+        // Auto-starts plan: first command is skaffold delete
         match cmds.as_slice() {
             [Command::RunSkaffold {
                 args,
                 skaffold_file,
                 ..
             }] => {
-                assert_eq!(args.first().map(String::as_str), Some("run"));
+                assert_eq!(args.first().map(String::as_str), Some("delete"));
                 assert_eq!(skaffold_file, &PathBuf::from("/tmp/svc/skaffold.yaml"));
             }
-            other => panic!("expected RunSkaffold, got {other:?}"),
+            other => panic!("expected RunSkaffold delete first, got {other:?}"),
         }
+        assert!(app.plan.as_ref().is_some_and(|p| p.executing));
         assert_eq!(app.screen, Screen::Jobs);
     }
 
@@ -2916,7 +3678,7 @@ mod tests {
     // —— M4 cascade ——
 
     #[test]
-    fn cascade_publish_builds_plan_from_graph() {
+    fn update_dependents_builds_plan_from_graph() {
         use crate::gradle::model::{Coordinate, DepReq, Produces, VersionSpec};
 
         let mut app = App::new(Config::default(), test_config_path());
@@ -2952,17 +3714,17 @@ mod tests {
         // select common-lib
         app.selected_index = 0;
 
-        let cmds = app.update(Action::CascadePublish);
+        let cmds = app.update(Action::UpdateDependents);
         assert!(cmds.is_empty());
         let plan = app.plan.as_ref().expect("plan open");
         assert!(!plan.executing);
-        assert_eq!(plan.recipe, crate::exec::RECIPE_PUBLISH_AND_REDEPLOY);
-        // publish + build + delete + run = 4
-        assert_eq!(plan.steps.len(), 4);
-        assert_eq!(plan.steps[0].project_name, "common-lib");
-        assert_eq!(plan.steps[1].project_name, "payments-api");
-        assert!(plan.steps[2].step_label().contains("delete"));
-        assert!(plan.steps[3].step_label().contains("run"));
+        assert_eq!(plan.recipe, crate::exec::RECIPE_UPDATE_DEPENDENTS);
+        // pull + clean + build + delete + run
+        assert_eq!(plan.steps.len(), 5);
+        assert_eq!(plan.steps[0].project_name, "payments-api");
+        assert!(plan.steps[0].step_label().contains("git pull"));
+        assert!(plan.steps[3].step_label().contains("delete"));
+        assert!(plan.steps[4].step_label().contains("run"));
     }
 
     #[test]
@@ -2999,47 +3761,30 @@ mod tests {
         )];
         app.apply_scan_projects(&[lib, svc]);
         app.selected_index = 0;
-        app.update(Action::CascadePublish);
+        app.update(Action::UpdateDependents);
         assert!(app.plan_confirming());
 
-        // Confirm → first gradle job
+        // Confirm → first step is git pull (may skip if no git root → clean)
         let cmds = app.update(Action::ConfirmCascadePlan);
         assert_eq!(app.screen, Screen::Jobs);
         assert!(app.plan.as_ref().is_some_and(|p| p.executing));
-        assert_eq!(cmds.len(), 1);
+        assert!(!cmds.is_empty(), "expected at least one job: {cmds:?}");
+        // First dispatch is either GitPull or Gradle clean if pull was skipped
         let id1 = match &cmds[0] {
-            Command::RunGradle { id, .. } => *id,
-            other => panic!("expected RunGradle, got {other:?}"),
-        };
-
-        // Finish step 1 ok → step 2 (consumer build)
-        let next = app.apply_event(AppEvent::JobFinished {
-            id: id1,
-            ok: true,
-            cancelled: false,
-            summary: "exit 0".into(),
-        });
-        assert_eq!(next.len(), 1);
-        let id2 = match &next[0] {
-            Command::RunGradle {
-                id,
-                project_name,
-                force_latest_snapshots,
-                ..
-            } => {
+            Command::GitPull { id, project_name, .. } => {
                 assert_eq!(project_name, "payments-api");
-                assert!(
-                    *force_latest_snapshots,
-                    "consumer rebuild should force SNAPSHOT re-resolve"
-                );
                 *id
             }
-            other => panic!("expected consumer gradle, got {other:?}"),
+            Command::RunGradle { id, project_name, .. } => {
+                assert_eq!(project_name, "payments-api");
+                *id
+            }
+            other => panic!("expected GitPull or RunGradle, got {other:?}"),
         };
 
-        // Fail step 2 → stop, no more commands, plan cleared
+        // Fail first step → stop
         let stopped = app.apply_event(AppEvent::JobFinished {
-            id: id2,
+            id: id1,
             ok: false,
             cancelled: false,
             summary: "exit 1".into(),
@@ -3049,7 +3794,7 @@ mod tests {
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|s| s.contains("cascade failed")),
+                .is_some_and(|s| s.contains("plan failed")),
             "{:?}",
             app.status_message
         );
@@ -3057,22 +3802,32 @@ mod tests {
 
     #[test]
     fn cascade_cancel_plan_before_run() {
+        use crate::gradle::model::{Coordinate, DepReq, Produces, VersionSpec};
+
         let mut app = App::new(Config::default(), test_config_path());
         app.show_splash = false;
-        app.projects = vec![sample_project("lib")];
-        app.graph = DependencyGraph::from_projects(&[]);
-        // Even with empty graph, plan can open as publish-only with warning.
-        // Need graph aligned with projects:
-        let d = discovered("lib", ProjectKind::Library, "1.0", "main", false, false);
-        app.apply_scan_projects(&[d]);
-        app.update(Action::CascadePublish);
+        let mut lib = discovered("lib", ProjectKind::Library, "1.0", "main", false, false);
+        lib.produces = vec![Produces::new(
+            Coordinate::new("g", "lib"),
+            "1.0",
+        )];
+        let mut svc = discovered("svc", ProjectKind::Service, "1.0", "main", true, false);
+        svc.depends = vec![DepReq::external(
+            Coordinate::new("g", "lib"),
+            VersionSpec::Exact("1.0".into()),
+            "implementation",
+            "x",
+        )];
+        app.apply_scan_projects(&[lib, svc]);
+        app.selected_index = 0;
+        app.update(Action::UpdateDependents);
         assert!(app.plan.is_some());
         app.update(Action::CancelCascadePlan);
         assert!(app.plan.is_none());
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|s| s.contains("cascade cancelled")),
+                .is_some_and(|s| s.contains("plan cancelled")),
             "{:?}",
             app.status_message
         );

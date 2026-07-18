@@ -112,11 +112,169 @@ fn run_git(git_root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Cached branch + dirty flag for a single git root.
+fn run_git_result(git_root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        return Err(if detail.is_empty() {
+            format!("git {:?} failed", args)
+        } else {
+            detail
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Stage `paths` (absolute or relative to `git_root`) and create a commit.
+///
+/// Returns `Ok(true)` if a commit was created, `Ok(false)` if there was nothing
+/// to commit after staging (already clean).
+pub fn commit_paths(
+    git_root: &Path,
+    paths: &[PathBuf],
+    message: &str,
+) -> Result<bool, String> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    if message.trim().is_empty() {
+        return Err("empty commit message".into());
+    }
+
+    let mut add_args: Vec<String> = vec!["add".into(), "--".into()];
+    for p in paths {
+        // Prefer path relative to git root for cleaner index entries.
+        let rel = p
+            .strip_prefix(git_root)
+            .map(|r| r.to_path_buf())
+            .unwrap_or_else(|_| p.clone());
+        add_args.push(rel.to_string_lossy().into_owned());
+    }
+    let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+    run_git_result(git_root, &add_refs)?;
+
+    // Nothing staged → no commit (e.g. file already matched HEAD).
+    let staged = run_git_result(git_root, &["diff", "--cached", "--name-only"])?;
+    if staged.is_empty() {
+        return Ok(false);
+    }
+
+    run_git_result(git_root, &["commit", "-m", message])?;
+    Ok(true)
+}
+
+/// Cached branch + dirty + remote lag for a single git root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitInfo {
     pub branch: String,
     pub dirty: bool,
+    /// Commits on upstream not in HEAD (`git rev-list --count HEAD..@{u}`).
+    pub behind: Option<u32>,
+    /// Commits on HEAD not on upstream.
+    pub ahead: Option<u32>,
+    /// Whether we successfully resolved an upstream tracking branch.
+    pub has_upstream: bool,
+}
+
+impl GitInfo {
+    /// Short projects-table cell: `↓3`, `↑2`, `↓1↑2`, `dirty`, `ok`, `—`.
+    pub fn sync_label(&self) -> String {
+        if self.branch == "—" {
+            return "—".into();
+        }
+        let mut parts = Vec::new();
+        if let Some(b) = self.behind {
+            if b > 0 {
+                parts.push(format!("↓{b}"));
+            }
+        }
+        if let Some(a) = self.ahead {
+            if a > 0 {
+                parts.push(format!("↑{a}"));
+            }
+        }
+        if self.dirty {
+            parts.push("·".into()); // dirty marker after lag
+        }
+        if parts.is_empty() {
+            if self.has_upstream {
+                if self.dirty {
+                    "dirty".into()
+                } else {
+                    "ok".into()
+                }
+            } else if self.dirty {
+                "dirty".into()
+            } else {
+                "—".into() // no upstream configured
+            }
+        } else if parts.len() == 1 && parts[0] == "·" {
+            "dirty".into()
+        } else {
+            // "↓3·" → "↓3" + dirty implied, or join
+            let dirty = self.dirty;
+            let lag: String = parts
+                .into_iter()
+                .filter(|p| p != "·")
+                .collect::<Vec<_>>()
+                .join("");
+            if dirty && lag.is_empty() {
+                "dirty".into()
+            } else if dirty {
+                format!("{lag}*")
+            } else {
+                lag
+            }
+        }
+    }
+}
+
+/// Fetch + lag counts for one root. `fetch` updates remote refs when true.
+pub fn git_remote_sync(git_root: &Path, fetch: bool) -> GitInfo {
+    let branch = git_branch(git_root);
+    let dirty = git_dirty(git_root);
+    if branch == "—" {
+        return GitInfo {
+            branch,
+            dirty,
+            behind: None,
+            ahead: None,
+            has_upstream: false,
+        };
+    }
+    if fetch {
+        // Best-effort; ignore failures (offline, auth).
+        let _ = run_git(git_root, &["fetch", "--quiet", "--prune"]);
+    }
+    let upstream = run_git(git_root, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+    let has_upstream = upstream.as_ref().is_some_and(|u| !u.is_empty());
+    let (behind, ahead) = if has_upstream {
+        let behind = run_git(git_root, &["rev-list", "--count", "HEAD..@{upstream}"])
+            .and_then(|s| s.parse().ok());
+        let ahead = run_git(git_root, &["rev-list", "--count", "@{upstream}..HEAD"])
+            .and_then(|s| s.parse().ok());
+        (behind, ahead)
+    } else {
+        (None, None)
+    };
+    GitInfo {
+        branch,
+        dirty,
+        behind,
+        ahead,
+        has_upstream,
+    }
 }
 
 /// Per-scan cache so monorepo multi-skaffold rows share one status query.
@@ -130,12 +288,15 @@ impl GitStatusCache {
         Self::default()
     }
 
-    /// Resolve (and cache) branch + dirty for `git_root`.
+    /// Resolve (and cache) branch + dirty for `git_root` (no fetch — scan-time).
     pub fn info(&mut self, git_root: &Path) -> &GitInfo {
         if !self.inner.contains_key(git_root) {
             let info = GitInfo {
                 branch: git_branch(git_root),
                 dirty: git_dirty(git_root),
+                behind: None,
+                ahead: None,
+                has_upstream: false,
             };
             self.inner.insert(git_root.to_path_buf(), info);
         }
@@ -148,6 +309,11 @@ impl GitStatusCache {
 
     pub fn dirty(&mut self, git_root: &Path) -> bool {
         self.info(git_root).dirty
+    }
+
+    /// Replace cache entry with full remote sync (used by **r** stats).
+    pub fn put(&mut self, git_root: PathBuf, info: GitInfo) {
+        self.inner.insert(git_root, info);
     }
 }
 
@@ -188,6 +354,54 @@ mod tests {
         assert_eq!(find_git_root(&nested), Some(root.canonicalize().unwrap()));
         assert_eq!(find_git_root(&root), Some(root.canonicalize().unwrap()));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commit_paths_creates_commit() {
+        let dir = temp_dir("commit");
+        assert!(Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+        // Identity for commit in CI/sandbox.
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(&dir)
+            .args(["config", "user.email", "tako@test"])
+            .status();
+        let _ = Command::new("git")
+            .args(["-C"])
+            .arg(&dir)
+            .args(["config", "user.name", "tako"])
+            .status();
+
+        let f = dir.join("build.gradle.kts");
+        fs::write(&f, "version = \"1.0.0\"\n").unwrap();
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&dir)
+            .args(["add", "build.gradle.kts"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&dir)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(&f, "version = \"1.0.1\"\n").unwrap();
+        let msg = "Bump versions due to common-lib dependency\n\n- svc: 1.0.0 → 1.0.1\n";
+        let created = commit_paths(&dir, &[f], msg).expect("commit");
+        assert!(created);
+        let log = run_git(&dir, &["log", "-1", "--pretty=%B"]).expect("log");
+        assert!(log.contains("Bump versions due to common-lib dependency"));
+        assert!(log.contains("1.0.0 → 1.0.1"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

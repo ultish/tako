@@ -11,6 +11,45 @@ over dumping raw commit subjects.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-18
+
+Workflow overhaul: tight keys, catch-up vs you-publish, Nexus/Git columns,
+skaffold always delete→run.
+
+### Added
+
+- **Tight workflow keys** (shared + kind extras):
+  - **b / B** build / force latest SNAPSHOT · **c** clean · **p** publish to Nexus
+  - **v** bump this version · **V** bump dependent versions (manual)
+  - **U** update full dependent tree (topo order; services: skaffold **delete→run** unless Argo)
+  - **u** this project skaffold **delete→run** · **x** delete only
+  - **r** refresh stats · **w** workspace scan · **G** git pull
+- **Full dependent tree** on project detail + **U** plan (transitive, topo build order).
+- **Who needs this? (`i`)**; deploy mode + Argo guard; filter/favorites; Deploy column.
+- **Help workflows (`?`)** — opens on a flowchart page (catch-up vs you-publish vs
+  single service); **Tab** switches to keybinds.
+- **U plan split:** child **libs** listed with Nexus status only (no local gradle);
+  **services** run git pull → clean → build (snap) → skaffold delete→run.
+- **Projects columns:** **Nexus** (maven-metadata vs local), **Git** (behind/ahead/
+  dirty after fetch), **Branch** (always). Press **r** to refresh git+nexus (+kube).
+- **Maven/Nexus repo auto-discovery** from Gradle `settings.gradle(.kts)` /
+  `build.gradle(.kts)` (`maven { url }` / `maven("…")`). Optional
+  `[nexus].repository_url` override only; `~/.m2` is fallback if Gradle yields nothing.
+
+### Changed
+
+- Skaffold redeploy always **delete then run** (image updates correctly).
+- **Mouse focus** on Workspace lists and Jobs panes.
+- Clearer graph wording: **This needs** / **Needed by**.
+- **`[scan].exclude`** exact match only.
+- Multi-select bulk **G** / **b** / **c** works with **Space** or **m** (filter-safe).
+
+### Removed
+
+- Catch-up (**C**), skaffold **dev/debug**, old **B/P/R** cascade recipes.
+- Publish-then-cascade as a single magic key (use **p** then **U**).
+- Required separate tako Nexus config — repos come from Gradle unless overridden.
+
 ## [0.1.0] - 2026-07-18
 
 First public release — multi-service Gradle + Skaffold control plane with

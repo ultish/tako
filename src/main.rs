@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod config;
+mod deploy;
 mod error;
 mod events;
 mod exec;
@@ -11,10 +12,12 @@ mod gradle;
 mod graph;
 mod jobs;
 mod kube;
+mod nexus;
 mod ring_buffer;
 mod scan;
 mod text_field;
 mod ui;
+mod version_bump;
 
 use std::collections::HashMap;
 use std::io::Stdout;
@@ -83,6 +86,22 @@ fn init_tracing(log_dir: &Path) -> AppResult<tracing_appender::non_blocking::Wor
     Ok(guard)
 }
 
+/// Shifted letter: `Char('U')` **or** `Char('u')`+SHIFT (terminal-dependent).
+fn is_shift_letter(key: KeyEvent, lower: char) -> bool {
+    let upper = lower.to_ascii_uppercase();
+    match key.code {
+        KeyCode::Char(c) if c == upper => true,
+        KeyCode::Char(c) if c == lower && key.modifiers.contains(KeyModifiers::SHIFT) => true,
+        _ => false,
+    }
+}
+
+/// Plain lowercase letter without SHIFT (so Shift+u does not match **u**).
+fn is_plain_letter(key: KeyEvent, lower: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c == lower)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 /// Translates a raw key press into an `Action`.
 fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
@@ -125,6 +144,80 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
         };
     }
 
+    // Argo skaffold confirm.
+    if app.pending_argo_skaffold.is_some() {
+        return match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::ForceQuit)
+            }
+            KeyCode::Char('y') | KeyCode::Enter => Some(Action::ConfirmArgoSkaffold),
+            KeyCode::Char('n') | KeyCode::Esc => Some(Action::CancelArgoSkaffold),
+            _ => None,
+        };
+    }
+
+    // Project filter typing mode.
+    if app.project_filter.is_some() && app.screen == Screen::ProjectBrowser {
+        // Multi-select + bulk still work while filtering (Space is not typed into the query).
+        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('m')) {
+            return Some(Action::ToggleMultiSelect);
+        }
+        if is_shift_letter(key, 'b') {
+            return Some(Action::BuildForce);
+        }
+        if is_plain_letter(key, 'b') {
+            return Some(Action::Build);
+        }
+        if is_plain_letter(key, 'c') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::Clean);
+        }
+        if is_shift_letter(key, 'g') {
+            return Some(Action::GitPull);
+        }
+        return match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::ForceQuit)
+            }
+            KeyCode::Esc => Some(Action::ClearProjectFilter),
+            KeyCode::Enter => Some(Action::ClearProjectFilter),
+            KeyCode::Backspace => Some(Action::ProjectFilterBackspace),
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(Action::ProjectFilterChar(c))
+            }
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveSelectionUp),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveSelectionDown),
+            _ => None,
+        };
+    }
+
+    // Bump dependents plan owns the keyboard.
+    if app.bump_confirming() {
+        return match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Action::ForceQuit)
+            }
+            KeyCode::Char('y') | KeyCode::Enter => Some(Action::ConfirmBumpDependents),
+            KeyCode::Char('n') | KeyCode::Esc => Some(Action::CancelBumpDependents),
+            KeyCode::Tab => Some(Action::CycleBumpKind),
+            KeyCode::Char('1') => {
+                Some(Action::SetBumpKind(crate::version_bump::BumpKind::Major))
+            }
+            KeyCode::Char('2') => {
+                Some(Action::SetBumpKind(crate::version_bump::BumpKind::Minor))
+            }
+            KeyCode::Char('3') => {
+                Some(Action::SetBumpKind(crate::version_bump::BumpKind::Patch))
+            }
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveSelectionUp),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveSelectionDown),
+            KeyCode::Char('q') => Some(Action::Quit),
+            _ => None,
+        };
+    }
+
     // Cascade plan confirm owns the keyboard (y/Enter run, n/Esc cancel, j/k scroll).
     if app.plan_confirming() {
         return match key.code {
@@ -141,7 +234,7 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
         };
     }
 
-    // Help overlay owns the keyboard (close with ? / Esc; quit still works).
+    // Help overlay owns the keyboard (close with ? / Esc; Tab switches page).
     if app.help_visible {
         return match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -149,6 +242,7 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
             }
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('?') | KeyCode::Esc => Some(Action::ToggleHelp),
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => Some(Action::CycleHelpPage),
             _ => None,
         };
     }
@@ -202,7 +296,7 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Down | KeyCode::Char('j') => return Some(Action::MoveSelectionDown),
             KeyCode::Enter => return Some(Action::Confirm),
             KeyCode::Esc => return Some(Action::Back),
-            KeyCode::Char('r') => return Some(Action::Refresh),
+            KeyCode::Char('w') => return Some(Action::Refresh),
             KeyCode::Char('?') => return Some(Action::ToggleHelp),
             KeyCode::Char('A') => return Some(Action::CycleBannerMode),
             KeyCode::Char('T') => return Some(Action::CycleTheme),
@@ -283,24 +377,61 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
         }
     }
 
-    // Project browser: exec + multi-select + cascade keybinds (M3/M4/M5).
+    // Project browser: workflow keys.
+    // Capital letters: handle both Char('U') and Char('u')+SHIFT (terminal-dependent).
+    // Critical: plain `u` must NOT match Shift+u, or Update Dependents never fires.
     if app.screen == Screen::ProjectBrowser {
+        if is_shift_letter(key, 'b') {
+            return Some(Action::BuildForce);
+        }
+        if is_plain_letter(key, 'b') {
+            return Some(Action::Build);
+        }
+        if is_plain_letter(key, 'c') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::Clean);
+        }
+        if is_plain_letter(key, 'p') {
+            return Some(Action::Publish);
+        }
+        if is_shift_letter(key, 'u') {
+            return Some(Action::UpdateDependents);
+        }
+        if is_plain_letter(key, 'u') {
+            return Some(Action::SkaffoldRedeploy);
+        }
+        if is_plain_letter(key, 'x') {
+            return Some(Action::SkaffoldDelete);
+        }
+        if is_shift_letter(key, 'v') {
+            return Some(Action::OpenBumpDependents);
+        }
+        if is_plain_letter(key, 'v') {
+            return Some(Action::OpenBumpVersion);
+        }
+        if is_plain_letter(key, 'i') {
+            return Some(Action::ToggleImpact);
+        }
+        if is_shift_letter(key, 'g') {
+            return Some(Action::GitPull);
+        }
+        if is_plain_letter(key, 'r') {
+            return Some(Action::RefreshStats);
+        }
+        if is_shift_letter(key, 'k') {
+            return Some(Action::RefreshDeployedVersions);
+        }
+        if is_plain_letter(key, 'w') {
+            return Some(Action::Refresh);
+        }
+        if is_shift_letter(key, 'f') {
+            return Some(Action::ToggleFavorite);
+        }
+        if is_plain_letter(key, 'f') {
+            return Some(Action::ToggleDriftFilter);
+        }
         match key.code {
-            KeyCode::Char(' ') => return Some(Action::ToggleMultiSelect),
-            KeyCode::Char('b') => return Some(Action::Build),
-            KeyCode::Char('B') => return Some(Action::BuildWithDeps),
-            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Some(Action::Clean);
-            }
-            KeyCode::Char('p') => return Some(Action::Publish),
-            KeyCode::Char('P') => return Some(Action::CascadePublish),
-            KeyCode::Char('d') => return Some(Action::SkaffoldDev),
-            KeyCode::Char('D') => return Some(Action::SkaffoldDebug),
-            KeyCode::Char('x') => return Some(Action::SkaffoldDelete),
-            KeyCode::Char('u') => return Some(Action::SkaffoldRun),
-            KeyCode::Char('G') => return Some(Action::GitPull),
-            KeyCode::Char('K') => return Some(Action::RefreshDeployedVersions),
-            KeyCode::Char('f') => return Some(Action::ToggleDriftFilter),
+            KeyCode::Char(' ') | KeyCode::Char('m') => return Some(Action::ToggleMultiSelect),
+            KeyCode::Char('/') => return Some(Action::StartProjectFilter),
             KeyCode::Char('-') => return Some(Action::ExcludeSelectedProjects),
             _ => {}
         }
@@ -315,39 +446,14 @@ fn key_to_action(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveSelectionDown),
         KeyCode::Enter => Some(Action::Confirm),
         KeyCode::Esc => Some(Action::Back),
-        KeyCode::Char('r') => Some(Action::Refresh),
+        KeyCode::Char('w') => Some(Action::Refresh),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
-        // Banner / theme cycles — capitals avoid clashing with typed text later.
         KeyCode::Char('A') => Some(Action::CycleBannerMode),
         KeyCode::Char('T') => Some(Action::CycleTheme),
-        // Top-level view switcher.
         KeyCode::Char('1') => Some(Action::SwitchToProjects),
         KeyCode::Char('2') => Some(Action::SwitchToJobs),
         KeyCode::Char('3') => Some(Action::SwitchToWorkspace),
         KeyCode::Char('4') => Some(Action::SwitchToSettings),
-        // Project browser exec / multi-select (M3/M5).
-        KeyCode::Char(' ') if app.screen == Screen::ProjectBrowser => {
-            Some(Action::ToggleMultiSelect)
-        }
-        KeyCode::Char('b') if app.screen == Screen::ProjectBrowser => Some(Action::Build),
-        KeyCode::Char('B') if app.screen == Screen::ProjectBrowser => Some(Action::BuildWithDeps),
-        KeyCode::Char('c') if app.screen == Screen::ProjectBrowser => Some(Action::Clean),
-        KeyCode::Char('p') if app.screen == Screen::ProjectBrowser => Some(Action::Publish),
-        KeyCode::Char('P') if app.screen == Screen::ProjectBrowser => Some(Action::CascadePublish),
-        KeyCode::Char('d') if app.screen == Screen::ProjectBrowser => Some(Action::SkaffoldDev),
-        KeyCode::Char('D') if app.screen == Screen::ProjectBrowser => Some(Action::SkaffoldDebug),
-        KeyCode::Char('x') if app.screen == Screen::ProjectBrowser => Some(Action::SkaffoldDelete),
-        KeyCode::Char('u') if app.screen == Screen::ProjectBrowser => Some(Action::SkaffoldRun),
-        KeyCode::Char('G') if app.screen == Screen::ProjectBrowser => Some(Action::GitPull),
-        KeyCode::Char('K') if app.screen == Screen::ProjectBrowser => {
-            Some(Action::RefreshDeployedVersions)
-        }
-        KeyCode::Char('f') if app.screen == Screen::ProjectBrowser => {
-            Some(Action::ToggleDriftFilter)
-        }
-        KeyCode::Char('-') if app.screen == Screen::ProjectBrowser => {
-            Some(Action::ExcludeSelectedProjects)
-        }
         KeyCode::Tab if app.screen == Screen::Jobs => Some(Action::ToggleJobsFocus),
         _ => None,
     }
@@ -442,7 +548,7 @@ fn handle_command(command: Command, app: &mut App, tx: &mpsc::UnboundedSender<Ap
             // args[0] is subcommand; remainder are extras (profile etc.).
             let (subcommand, extra) = match args.split_first() {
                 Some((sub, rest)) => (sub.as_str(), rest),
-                None => ("dev", &[][..]),
+                None => ("run", &[][..]),
             };
             let planned = exec::skaffold_argv(&exec::SkaffoldPlan {
                 command: &program,
@@ -475,6 +581,9 @@ fn handle_command(command: Command, app: &mut App, tx: &mpsc::UnboundedSender<Ap
         Command::ProbeKubeVersions => {
             spawn_kube_probe(app, tx);
         }
+        Command::ProbeRepoStats { fetch_git } => {
+            spawn_repo_stats(app, fetch_git, tx);
+        }
     }
 }
 
@@ -487,6 +596,33 @@ fn spawn_kube_probe(app: &mut App, tx: &mpsc::UnboundedSender<AppEvent>) {
         let batch = kube::probe_deployed_versions(&projects, &kube);
         if let Err(err) = tx.send(AppEvent::KubeProbeFinished { batch }) {
             tracing::warn!("failed to deliver kube probe result: {err}");
+        }
+    });
+}
+
+/// Off-thread git fetch/lag + Nexus maven-metadata probe (**r**).
+fn spawn_repo_stats(app: &mut App, fetch_git: bool, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let projects = app.projects.clone();
+    let graph = app.graph.clone();
+    let nexus_cfg = app.config.nexus.clone();
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::collections::HashMap;
+        let mut by_root: HashMap<PathBuf, crate::git::GitInfo> = HashMap::new();
+        for p in &projects {
+            let Some(root) = p.git_root.as_ref() else {
+                continue;
+            };
+            if by_root.contains_key(root) {
+                continue;
+            }
+            by_root.insert(root.clone(), crate::git::git_remote_sync(root, fetch_git));
+        }
+        let git: Vec<_> = by_root.into_iter().collect();
+        let nexus = crate::nexus::probe_nexus_versions(&projects, &graph, &nexus_cfg);
+        let error = None;
+        if let Err(err) = tx.send(AppEvent::RepoStatsFinished { git, nexus, error }) {
+            tracing::warn!("failed to deliver repo stats: {err}");
         }
     });
 }
