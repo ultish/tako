@@ -7,7 +7,11 @@
 //! 3. Fallback: `~/.m2/settings.xml` mirrors/repositories
 //! 4. Otherwise leave the Nexus column as `—`
 //!
-//! No separate “enable Nexus” flag — repos come from how Gradle is already set up.
+//! **Who gets probed:** any Gradle library/avro/service with a resolvable GAV.
+//! We never require `` `maven-publish` `` or a `publishing { }` block in the
+//! project’s build file — real repos apply that via convention plugins.
+//! GAV group comes from scripts / `gradle.properties` / parents, or
+//! optional `[nexus].default_group` when only the plugin sets `project.group`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +19,61 @@ use std::process::Command;
 
 use crate::app::{ProjectKind, ProjectRow};
 use crate::config::NexusConfig;
+use crate::gradle::parse::resolve_project_group;
 use crate::graph::DependencyGraph;
+
+/// Resolve group:artifact + local version for a Nexus probe.
+///
+/// Prefer graph `produces` (from scan). If empty — common when group is only set
+/// inside a convention plugin — fall back to scripts/properties, then
+/// `[nexus].default_group`, with artifact = directory name.
+fn resolve_probe_gav(
+    project: &ProjectRow,
+    graph: &DependencyGraph,
+    idx: usize,
+    cfg: &NexusConfig,
+) -> Option<(String, String, String)> {
+    let id = graph
+        .id_at(idx)
+        .unwrap_or(project.name.as_str())
+        .to_string();
+    let produces = graph.produces_of_id(&id);
+    if let Some(p) = produces.first() {
+        let local = if p.version.is_empty() || p.version == "—" {
+            project.version.clone()
+        } else {
+            p.version.clone()
+        };
+        return Some((
+            p.coordinate.group.clone(),
+            p.coordinate.name.clone(),
+            local,
+        ));
+    }
+
+    let group = resolve_project_group(project.path.as_path(), project.gradle_root.as_deref())
+        .or_else(|| {
+            let g = cfg.default_group.trim();
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.to_string())
+            }
+        })?;
+
+    let artifact = project
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())?;
+
+    let local = if project.version == "—" {
+        String::new()
+    } else {
+        project.version.clone()
+    };
+    Some((group, artifact, local))
+}
 
 /// Result of probing one published artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,11 +96,23 @@ pub struct NexusBatch {
 }
 
 /// True when this project is a publisher we should check on Maven/Nexus.
+///
+/// Libraries and avro always qualify. **Any project with a Gradle root**
+/// also qualifies (including skaffold services) — publish is often applied only
+/// by a shared convention plugin, so the leaf build file may never mention
+/// `maven-publish`. Pure non-Gradle rows stay out (`—`).
 pub fn should_probe_nexus(project: &ProjectRow) -> bool {
-    matches!(project.kind, ProjectKind::Library | ProjectKind::Avro)
-        || (!project.has_skaffold
-            && project.skaffold_path.is_none()
-            && !matches!(project.kind, ProjectKind::Service))
+    if matches!(project.kind, ProjectKind::Library | ProjectKind::Avro) {
+        return true;
+    }
+    // Gradle module (service or otherwise) — convention plugin may publish.
+    if project.gradle_root.is_some() {
+        return true;
+    }
+    // Fallback: non-skaffold, non-service without gradle_root set.
+    !project.has_skaffold
+        && project.skaffold_path.is_none()
+        && !matches!(project.kind, ProjectKind::Service)
 }
 
 /// Resolve repository base URLs: override → Gradle scripts on projects → m2 settings.
@@ -259,7 +329,8 @@ fn extract_urls_from_settings_xml(xml: &str) -> Vec<String> {
     urls
 }
 
-/// Probe latest published versions for library/avro projects that produce coordinates.
+/// Probe latest published versions for projects that produce Maven coordinates
+/// (libraries, avro, and Gradle services with `maven-publish`).
 pub fn probe_nexus_versions(
     projects: &[ProjectRow],
     graph: &DependencyGraph,
@@ -290,32 +361,21 @@ pub fn probe_nexus_versions(
         if !should_probe_nexus(project) {
             continue;
         }
-        let id = graph
-            .id_at(idx)
-            .unwrap_or(project.name.as_str())
-            .to_string();
-        let produces = graph.produces_of_id(&id);
-        if produces.is_empty() {
+        let Some((group, artifact, local)) = resolve_probe_gav(project, graph, idx, cfg) else {
             probes.push(NexusProbe {
                 project_path: project.path.display().to_string(),
                 label: "—".into(),
-                detail: "no produces coordinates".into(),
+                detail: "no Maven GAV (set group in build/properties or [nexus].default_group)"
+                    .into(),
             });
             continue;
-        }
-
-        let coord = &produces[0].coordinate;
-        let local = if produces[0].version.is_empty() || produces[0].version == "—" {
-            project.version.as_str()
-        } else {
-            produces[0].version.as_str()
         };
 
         // Try each discovered repo until one returns metadata.
         let mut last_err = String::new();
         let mut found = None;
         for base in &bases {
-            let url = metadata_url(base, &coord.group, &coord.name);
+            let url = metadata_url(base, &group, &artifact);
             match fetch_maven_latest(&url) {
                 Ok(remote) => {
                     found = Some((remote, base.clone()));
@@ -327,11 +387,11 @@ pub fn probe_nexus_versions(
 
         match found {
             Some((remote, base)) => {
-                let (label, detail) = compare_versions(local, &remote);
+                let (label, detail) = compare_versions(&local, &remote);
                 probes.push(NexusProbe {
                     project_path: project.path.display().to_string(),
                     label,
-                    detail: format!("{detail} · {base}"),
+                    detail: format!("{detail} · {group}:{artifact} · {base}"),
                 });
             }
             None => {
@@ -343,7 +403,7 @@ pub fn probe_nexus_versions(
                     } else {
                         "?".into()
                     },
-                    detail: last_err,
+                    detail: format!("{group}:{artifact} · {last_err}"),
                 });
             }
         }
@@ -549,6 +609,56 @@ mod tests {
         let urls = extract_urls_from_gradle(groovy);
         assert!(urls.iter().any(|u| u.contains("azure.com")), "{urls:?}");
         assert!(urls.iter().any(|u| u.contains("repo.spring.io")), "{urls:?}");
+    }
+
+    #[test]
+    fn resolve_probe_uses_default_group_when_no_produces() {
+        let mut svc = ProjectRow::new(
+            "payments-api",
+            "/work/payments-api",
+            ProjectKind::Service,
+            "2.0.0",
+            "main",
+        );
+        svc.gradle_root = Some("/work/payments-api".into());
+        let graph = DependencyGraph::default();
+        let cfg = NexusConfig {
+            repository_url: String::new(),
+            default_group: "com.example".into(),
+        };
+        let gav = resolve_probe_gav(&svc, &graph, 0, &cfg).expect("gav");
+        assert_eq!(gav.0, "com.example");
+        assert_eq!(gav.1, "payments-api");
+        assert_eq!(gav.2, "2.0.0");
+    }
+
+    #[test]
+    fn should_probe_gradle_service_like_c3po() {
+        // skaffold services still publish (often via convention plugin)
+        let mut svc = ProjectRow::new(
+            "robots/c3po",
+            "/tmp/robots/c3po",
+            ProjectKind::Service,
+            "0.1.0",
+            "main",
+        );
+        svc.has_skaffold = true;
+        svc.skaffold_path = Some("/tmp/robots/c3po/skaffold.yaml".into());
+        svc.gradle_root = Some("/tmp/robots/c3po".into());
+        assert!(should_probe_nexus(&svc));
+
+        let pure_svc = ProjectRow::new(
+            "ui-only",
+            "/tmp/ui-only",
+            ProjectKind::Service,
+            "—",
+            "main",
+        );
+        // Service without gradle_root → no Nexus column
+        assert!(!should_probe_nexus(&pure_svc));
+
+        let lib = ProjectRow::new("util-core", "/tmp/util-core", ProjectKind::Library, "1.0.0", "main");
+        assert!(should_probe_nexus(&lib));
     }
 
     #[test]

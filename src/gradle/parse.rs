@@ -1,13 +1,17 @@
 //! Light static extraction from `build.gradle.kts` / `build.gradle`.
 //!
 //! No Gradle daemon — string/regex-style patterns for:
-//! - `group = "…"`
+//! - `group = "…"` (also `gradle.properties`, parent/root scripts)
 //! - `archivesName` / `base.archivesName`
 //! - `implementation("g:n:v")` / `api("…")` / `compileOnly` / `runtimeOnly`
 //! - `implementation(libs.xxx.yyy)`
 //! - `implementation(project(":module"))`
 //!
 //! Produces coordinates use `group` + artifact name + project version.
+//!
+//! **Publish plugins are not required in source.** Real codebases often apply
+//! `maven-publish` only inside a convention / shared Gradle plugin; tako never
+//! greps for `` `maven-publish` `` or a `publishing { }` block.
 
 use std::fs;
 use std::path::Path;
@@ -73,14 +77,19 @@ pub fn extract_for_project(
         }
     }
 
-    // Artifact name fallback: directory name.
+    // Group often lives outside the leaf build file (gradle.properties, root
+    // allprojects/subprojects, or only inside a convention plugin — latter
+    // needs [nexus].default_group at probe time).
+    if model.group.is_none() {
+        model.group = resolve_project_group(project_dir, gradle_root);
+    }
+
+    // Artifact name fallback: directory name, then settings rootProject.name.
     if model.artifact_name.is_none() {
         if let Some(n) = project_dir.file_name() {
             model.artifact_name = Some(n.to_string_lossy().into_owned());
         }
     }
-
-    // Also try settings.gradle.kts rootProject.name for monorepo roots.
     if model.artifact_name.is_none() {
         if let Some(root) = gradle_root {
             for name in ["settings.gradle.kts", "settings.gradle"] {
@@ -94,7 +103,8 @@ pub fn extract_for_project(
         }
     }
 
-    // Produce coordinate when we have a group (or invent from folder heuristics).
+    // Produce coordinate when we have a group + name. Do **not** require
+    // `maven-publish` in the build script — convention plugins apply that.
     if let (Some(group), Some(name)) = (model.group.clone(), model.artifact_name.clone()) {
         let ver = if version == "—" {
             String::new()
@@ -108,6 +118,89 @@ pub fn extract_for_project(
     }
 
     model
+}
+
+/// Resolve Maven `group` without requiring it in the leaf build file.
+///
+/// Order: module build scripts → module `gradle.properties` → walk parents
+/// (properties + build scripts) up through `gradle_root` → settings root scripts.
+pub fn resolve_project_group(project_dir: &Path, gradle_root: Option<&Path>) -> Option<String> {
+    for name in ["build.gradle.kts", "build.gradle"] {
+        if let Ok(content) = fs::read_to_string(project_dir.join(name)) {
+            if let Some(g) = parse_group(&content) {
+                return Some(g);
+            }
+        }
+    }
+    if let Ok(content) = fs::read_to_string(project_dir.join("gradle.properties")) {
+        if let Some(g) = parse_group_from_properties(&content) {
+            return Some(g);
+        }
+    }
+
+    let stop = gradle_root.map(|p| p.to_path_buf());
+    let mut cur = project_dir.to_path_buf();
+    loop {
+        if !cur.pop() {
+            break;
+        }
+        if let Ok(content) = fs::read_to_string(cur.join("gradle.properties")) {
+            if let Some(g) = parse_group_from_properties(&content) {
+                return Some(g);
+            }
+        }
+        for name in ["build.gradle.kts", "build.gradle"] {
+            if let Ok(content) = fs::read_to_string(cur.join(name)) {
+                if let Some(g) = parse_group(&content) {
+                    return Some(g);
+                }
+            }
+        }
+        if stop.as_ref().is_some_and(|s| s == &cur) {
+            break;
+        }
+        if cur.parent().is_none() {
+            break;
+        }
+    }
+
+    if let Some(root) = gradle_root {
+        for name in ["build.gradle.kts", "build.gradle"] {
+            if let Ok(content) = fs::read_to_string(root.join(name)) {
+                if let Some(g) = parse_group(&content) {
+                    return Some(g);
+                }
+            }
+        }
+        if let Ok(content) = fs::read_to_string(root.join("gradle.properties")) {
+            if let Some(g) = parse_group_from_properties(&content) {
+                return Some(g);
+            }
+        }
+    }
+    None
+}
+
+/// `group=com.example` in `gradle.properties`.
+pub fn parse_group_from_properties(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("group") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let g = rest.trim().trim_matches('"').trim_matches('\'').trim();
+        if !g.is_empty() {
+            return Some(g.to_string());
+        }
+    }
+    None
 }
 
 fn merge_model(into: &mut GradleModel, from: GradleModel) {
@@ -426,6 +519,74 @@ common-lib = { module = "com.example:common-lib", version.ref = "common" }
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn resolve_group_from_properties_without_maven_publish_text() {
+        let dir = tempfile_dir("grp-props");
+        // Convention plugin applies publish — leaf build never mentions it.
+        fs::write(
+            dir.join("build.gradle.kts"),
+            r#"
+            plugins { alias(libs.plugins.company.conventions) }
+            version = "1.2.3"
+            "#,
+        )
+        .unwrap();
+        fs::write(dir.join("gradle.properties"), "group=com.company.platform\n").unwrap();
+        let model = extract_for_project(&dir, "1.2.3", Some(&dir), None);
+        assert_eq!(model.group.as_deref(), Some("com.company.platform"));
+        assert_eq!(model.produces.len(), 1);
+        assert_eq!(
+            model.produces[0].coordinate.key(),
+            format!(
+                "com.company.platform:{}",
+                dir.file_name().unwrap().to_string_lossy()
+            )
+        );
+        // Explicit: no maven-publish string required
+        let build = fs::read_to_string(dir.join("build.gradle.kts")).unwrap();
+        assert!(!build.contains("maven-publish"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_group_from_root_build_for_submodule() {
+        let root = tempfile_dir("grp-root");
+        let mod_dir = root.join("svc-a");
+        fs::create_dir_all(&mod_dir).unwrap();
+        fs::write(
+            root.join("build.gradle.kts"),
+            r#"
+            subprojects {
+                group = "com.corp.shared"
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join("build.gradle.kts"),
+            "plugins { java }\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let g = resolve_project_group(&mod_dir, Some(&root));
+        assert_eq!(g.as_deref(), Some("com.corp.shared"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "tako-gradle-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&d);
+        d
     }
 
     #[test]

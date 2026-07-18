@@ -328,18 +328,22 @@ impl Default for KubeConfig {
     }
 }
 
-/// Optional Maven repo override under `[nexus]`.
+/// Optional Maven/Nexus probe helpers under `[nexus]`.
 ///
-/// By default tako finds repo URLs from each project's **Gradle** scripts
-/// (`settings.gradle(.kts)` / `build.gradle(.kts)` — `maven { url = … }`,
-/// `mavenCentral()`, etc.), then falls back to `~/.m2/settings.xml`.
-/// Only set `repository_url` if you need to force one base URL.
+/// Repo URLs: Gradle `settings`/`build` scripts first, then `~/.m2`.
+/// Publishing is **not** detected via `` `maven-publish` `` text — convention
+/// plugins often apply that; tako probes any Gradle module with a GAV.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NexusConfig {
     /// Optional override base URL. Empty → discover from Gradle scripts / m2.
     /// Example: `https://nexus.example.com/repository/maven-public`
     #[serde(default)]
     pub repository_url: String,
+    /// Fallback Maven `group` when projects don't declare it in scripts/properties
+    /// (common when a shared convention plugin sets `project.group`).
+    /// Example: `com.mycompany.platform`
+    #[serde(default)]
+    pub default_group: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

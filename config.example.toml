@@ -61,11 +61,14 @@ max_parallel = 5
 argo_guard = true       # confirm before skaffold if the project is Argo-managed
 # modes = { "payments-api" = "argocd", "animals/cat" = "skaffold" }
 
-# Optional override only. By default **r** finds Maven repos from your Gradle
-# settings/build scripts (maven { url = uri("…") }, mavenCentral(), …), then
-# falls back to ~/.m2/settings.xml.
+# Optional Nexus probe helpers. By default **r** finds Maven repos from your
+# Gradle settings/build scripts (maven { url = uri("…") }, mavenCentral(), …),
+# then ~/.m2. Publishing need not appear in the leaf build file (convention
+# plugins often apply maven-publish).
 # [nexus]
 # repository_url = "https://nexus.example.com/repository/maven-public"
+# # when group is only set inside a shared Gradle plugin:
+# default_group = "com.mycompany.platform"
 
 # TUI appearance (also set by A / T keys in the app, which write back here).
 [ui]

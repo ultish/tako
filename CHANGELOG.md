@@ -11,6 +11,16 @@ over dumping raw commit subjects.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-18
+
+### Fixed
+
+- **Nexus** column now probes Gradle **services** (and any Gradle module), not only
+  library/avro — publish is often applied by a **convention plugin**, so the leaf
+  build file need not mention `maven-publish`.
+- Resolve Maven **group** from `gradle.properties` / parent root scripts, and
+  optional **`[nexus].default_group`** when only a shared plugin sets `project.group`.
+
 ## [0.2.1] - 2026-07-18
 
 ### Changed
